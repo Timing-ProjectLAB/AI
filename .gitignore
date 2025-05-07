@@ -1,1 +1,5 @@
 .env
+# Chroma 벡터스토어
+chroma_policies/
+*.sqlite3
+*.bin
