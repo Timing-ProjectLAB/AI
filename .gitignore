@@ -1,8 +1,1 @@
 .env
-# Chroma 벡터스토어
-chroma_policies/chroma.sqlite3
-chroma_policies/1ef6b65b-0763-4497-83f1-0772ee0802d1/data_level0.bin
-chroma_policies/1ef6b65b-0763-4497-83f1-0772ee0802d1/header.bin
-chroma_policies/1ef6b65b-0763-4497-83f1-0772ee0802d1/index_metadata.pickle
-chroma_policies/1ef6b65b-0763-4497-83f1-0772ee0802d1/length.bin
-chroma_policies/1ef6b65b-0763-4497-83f1-0772ee0802d1/link_lists.bin
