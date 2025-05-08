@@ -5,12 +5,13 @@
 
 import os, re, json
 from typing import List, Tuple
-from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 from langchain.prompts import (
-    ChatPromptTemplate, SystemMessagePromptTemplate, HumanMessagePromptTemplate
+    ChatPromptTemplate, 
+    SystemMessagePromptTemplate, 
+    HumanMessagePromptTemplate
 )
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
@@ -252,7 +253,7 @@ def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalC
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         input_key="question",
-        output_key="answer",   # ✅ 저장할 필드 지정
+        output_key="answer",  
         return_messages=True
     )
     return ConversationalRetrievalChain.from_llm(
