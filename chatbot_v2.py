@@ -23,7 +23,7 @@ from langchain.prompts import (
     HumanMessagePromptTemplate,
 )
 from langchain.chains import ConversationalRetrievalChain
-
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 # 관심 키워드와 지역명
 INTEREST_MAPPING = {
     "창업": ["창업", "창업 지원", "스타트업", "기업 설립"],
@@ -60,55 +60,68 @@ REGION_MAPPING = {
 def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) -> Chroma:
     os.environ["OPENAI_API_KEY"] = api_key
 
+    embedding = OpenAIEmbeddings()
+
+    # 이미 생성된 DB가 있으면 로드
     if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        vectordb = Chroma(persist_directory=persist_dir, embedding_function=OpenAIEmbeddings())
+        vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
         print("저장된 Chroma DB 로드 완료")
-    else:
-        with open(json_path, encoding="utf-8") as f:
-            policies = json.load(f)
+        return vectordb
 
-        docs: List[Document] = []
-        for p in policies:
-            text = (
-                f"정책명: {p['title']}\n"
-                f"지원대상: 나이 {p.get('min_age', '0')}세 ~ {p.get('max_age', '99')}세 / 지역 {', '.join(p['region_name'])}\n"
-                f"혜택: {p.get('support_content', '')}\n"
-                f"신청방법: {p.get('apply_method', '')}\n"
-                f"설명: {p.get('description', '')}\n"
-                f"링크: {p.get('apply_url', '')}"
-            )
-            meta = {
-                "policy_id": p["policy_id"],
-                "region": ", ".join(p["region_name"]),
-                "support_content": p.get("support_content", "")
-            }
-            docs.append(Document(page_content=text, metadata=meta))
+    # JSON에서 정책 문서 로드
+    with open(json_path, encoding="utf-8") as f:
+        policies = json.load(f)
 
-        vectordb = Chroma.from_documents(
-            docs,
-            embedding=OpenAIEmbeddings(),
-            persist_directory=persist_dir,
+    docs: List[Document] = []
+    for p in policies:
+        text = (
+            f"정책명: {p['title']}\n"
+            f"지원대상: 나이 {p.get('min_age', '0')}세 ~ {p.get('max_age', '99')}세 / 지역 {', '.join(p['region_name'])}\n"
+            f"혜택: {p.get('support_content', '')}\n"
+            f"신청방법: {p.get('apply_method', '')}\n"
+            f"설명: {p.get('description', '')}\n"
+            f"링크: {p.get('apply_url', '')}"
         )
-        vectordb.persist()
-        print("새로 Chroma DB 생성 및 저장 완료")
+        meta = {
+            "policy_id": p["policy_id"],
+            "region": ", ".join(p["region_name"]),
+            "support_content": p.get("support_content", "")
+        }
+        docs.append(Document(page_content=text, metadata=meta))
 
+    # 문서를 청크로 분할
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    split_docs = text_splitter.split_documents(docs)
+
+    # 빈 Chroma DB 생성
+    vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+
+    # 배치 단위로 안전하게 임베딩 추가
+    batch_size = 100
+    for i in range(0, len(split_docs), batch_size):
+        batch = split_docs[i:i + batch_size]
+        vectordb.add_documents(batch)
+
+    vectordb.persist()
+    print("새로 Chroma DB 생성 및 저장 완료")
     return vectordb
 
 # 유저 입력 파싱
 def parse_user_input(text: str) -> Tuple[int, str, List[str]]:
-    # 1. 나이 추출
+    # 1. 나이 추출 (예: "25세", "만 25세", "25 살")
     age = 0
-    if m := re.search(r"(\d{2})\s*세", text):
-        age = int(m.group(1))
+    age_match = re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text)
+    if age_match:
+        age = int(age_match.group(1))
 
-    # 2. 지역 추출
+    # 2. 지역 추출 (가장 먼저 매칭된 하나만)
     region = ""
     for std_region, keywords in REGION_MAPPING.items():
         if any(keyword in text for keyword in keywords):
             region = std_region
             break
 
-    # 3. 관심사 추출
+    # 3. 관심사 추출 (복수 선택 가능)
     interests = []
     for std_interest, keywords in INTEREST_MAPPING.items():
         if any(keyword in text for keyword in keywords):
@@ -195,14 +208,23 @@ def console_chat(rag_chain: ConversationalRetrievalChain):
         filtered_docs = []
         for d in res["source_documents"]:
             doc_region = d.metadata.get("region", "")
-            region_match = region in doc_region if region else True
-            if region_match:
-                filtered_docs.append(d)
+            doc_text = d.page_content
 
+            region_match = any(
+                keyword in doc_region for keyword in REGION_MAPPING.get(region, [])
+                )
+            interest_match = any(
+                keyword in doc_text
+                for interest in interests
+                for keyword in INTEREST_MAPPING.get(interest, [])
+            )
+
+            # 조건을 조금 더 유연하게 (둘 중 하나라도 맞으면 포함)
+            if region_match or interest_match:
+                filtered_docs.append(d)
         if filtered_docs:
             print(f"\nBot:\n{res['answer']}\n")
-            for d in filtered_docs[:3]:
-                print(f"- {d.metadata['policy_id']}")
+            #print(f"(총 {len(filtered_docs)}개의 정책이 검색되었습니다.)\n")
         else:
             print("\nBot: 조건에 맞는 정책을 찾지 못했습니다.\n")
 
