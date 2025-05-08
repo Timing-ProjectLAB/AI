@@ -17,7 +17,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
 # ─────────────────────────────────── #
-# ① 관심사 · 지역 맵
+# 1. 관심사 · 지역 맵
 # ─────────────────────────────────── #
 INTEREST_MAPPING = {
     "창업":  ["창업", "스타트업", "기업 설립"],
@@ -132,7 +132,7 @@ REGION_MAPPING = {
 }
 
 # ─────────────────────────────────── #
-# ② 정책 키워드 · 카테고리
+# 2. 정책 키워드 · 카테고리
 # ─────────────────────────────────── #
 KEYWORDS = [
     "바우처", "해외진출", "장기미취업청년", "맞춤형상담서비스", "교육지원",
@@ -154,7 +154,7 @@ def extract_categories(cat_field: str) -> List[str]:
     return [p for p in parts if p in CATEGORIES]
 
 # ─────────────────────────────────── #
-# ③ 벡터스토어 로드/생성
+# 3. 벡터스토어 로드/생성
 # ─────────────────────────────────── #
 def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) -> Chroma:
     os.environ["OPENAI_API_KEY"] = api_key
@@ -194,7 +194,7 @@ def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) ->
     return vectordb
 
 # ─────────────────────────────────── #
-# ④ 사용자 입력 파싱
+# 4. 사용자 입력 파싱
 # ─────────────────────────────────── #
 def parse_user_input(text: str) -> Tuple[int, str, List[str]]:
     age = 0
@@ -213,7 +213,7 @@ def parse_user_input(text: str) -> Tuple[int, str, List[str]]:
     return age, region, interests
 
 # ─────────────────────────────────── #
-# ⑤ 시스템 프롬프트
+# 5. 시스템 프롬프트
 # ─────────────────────────────────── #
 SYSTEM = SystemMessagePromptTemplate.from_template("""
 당신은 대한민국 청년을 위한 정책 안내 챗봇입니다. 사용자의 입력과 제공된 context 문서를 바탕으로, 해당 청년에게 가장 적합한 정책을 찾아 안내하는 역할을 수행합니다.
@@ -244,7 +244,7 @@ combine_prompt = ChatPromptTemplate.from_messages([
 ])
 
 # ─────────────────────────────────── #
-# ⑥ RAG 체인
+# 6. RAG 체인
 # ─────────────────────────────────── #
 def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalChain:
     llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
@@ -262,7 +262,7 @@ def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalC
     )
 
 # ─────────────────────────────────── #
-# ⑦ 가중치 필터 & 폴백
+# 7. 가중치 필터 & 폴백
 # ─────────────────────────────────── #
 MIN_SCORE = 1  # 필터 임계값
 
@@ -299,7 +299,7 @@ def filter_docs(docs, user_text: str, region: str, interests: List[str]):
     return [d for _, d in sorted(filtered, key=lambda x: x[0], reverse=True)]
 
 # ─────────────────────────────────── #
-# ⑧ 콘솔 채팅
+# 8. 콘솔 채팅
 # ─────────────────────────────────── #
 def console_chat(chain):
     print("(Ctrl+C 종료)\n")
@@ -319,15 +319,3 @@ def console_chat(chain):
 
         print("─" * 60)
 
-# ─────────────────────────────────── #
-# ⑨ main
-# ─────────────────────────────────── #
-if __name__ == "__main__":
-    load_dotenv()
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    JSON_PATH   = "ms_v3_short.json"
-    PERSIST_DIR = "./chroma_policies"
-
-    vectordb  = load_or_build_vectorstore(JSON_PATH, PERSIST_DIR, api_key)
-    rag_chain = create_rag_chain(vectordb, api_key)
-    console_chat(rag_chain)
