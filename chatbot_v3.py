@@ -30,6 +30,25 @@ INTEREST_MAPPING = {
     "해외연수": ["해외연수", "글로벌 연수", "교환학생"],
     "인턴십": ["인턴십", "현장실습", "산학협력"]
 }
+REGION_KEYWORDS = {
+    "서울": ["서울", "서울시"],
+    "경기": ["경기", "경기도"],
+    "인천": ["인천", "인천시"],
+    "부산": ["부산"],
+    "대구": ["대구"],
+    "광주": ["광주"],
+    "대전": ["대전"],
+    "울산": ["울산"],
+    "세종": ["세종"],
+    "강원": ["강원", "강원도", "강원특별자치도"],
+    "충북": ["충북", "충청북도"],
+    "충남": ["충남", "충청남도"],
+    "전북": ["전북", "전라북도"],
+    "전남": ["전남", "전라남도"],
+    "경북": ["경북", "경상북도"],
+    "경남": ["경남", "경상남도"],
+    "제주": ["제주", "제주도", "제주특별자치도"]
+}
 
 REGION_MAPPING = {
     "서울": [
@@ -128,7 +147,7 @@ REGION_MAPPING = {
         "경상남도 함양군", "경상남도 거창군", "경상남도 합천군"
     ],
     "제주": [
-        "제주특별자치도 제주시", "제주특별자치도 서귀포시"
+        "제주특별자치도 제주시", "제주특별자치도 서귀포시", "제주도"
     ]
 }
 
@@ -199,19 +218,26 @@ def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) ->
 # ─────────────────────────────────── #
 def parse_user_input(text: str) -> Tuple[int, str, List[str]]:
     age = 0
-    if m := re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text):
+    if m := re.search(r"(?:만\\s*)?(\\d{2})\\s*(?:세|살)", text):
         age = int(m.group(1))
 
     region = ""
-    for std_r, kws in REGION_MAPPING.items():
-        if any(k in text for k in kws):
+    for std_r, keywords in REGION_KEYWORDS.items():
+        if any(k in text for k in keywords):
             region = std_r
             break
+
+    if not region:
+        for std_r, kws in REGION_MAPPING.items():
+            if any(k in text for k in kws):
+                region = std_r
+                break
 
     interests = [
         std_i for std_i, kws in INTEREST_MAPPING.items() if any(k in text for k in kws)
     ]
     return age, region, interests
+
 
 # ─────────────────────────────────── #
 # 5. 시스템 프롬프트
@@ -268,11 +294,12 @@ def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalC
         output_key="answer",  
         return_messages=True
     )
-    return ConversationalRetrievalChain.from_llm(
+    chain =  ConversationalRetrievalChain.from_llm(
         llm, retriever, memory=memory,
         combine_docs_chain_kwargs={"prompt": combine_prompt, "document_variable_name": "context"},
         output_key="answer", return_source_documents=True
     )
+    return chain, llm
 
 # ─────────────────────────────────── #
 # 7. 가중치 필터 & 폴백
@@ -349,21 +376,44 @@ def filter_docs(docs, user_text: str, region: str, interests: List[str]):
 # ─────────────────────────────────── #
 # 8. 콘솔 채팅
 # ─────────────────────────────────── #
-def console_chat(chain):
+def console_chat(chain, llm):
     print("(Ctrl+C 종료)\n")
     while True:
-        user = input("You: ")
+        user = input("You: ").strip()
         age, region, interests = parse_user_input(user)
-        res = chain.invoke({"question": user})
 
+        # 사용자 조건이 없는 경우에만 메타 질문으로 인식
+        if age == 0 and not region and not interests:
+            if re.search(r"(총|전체)?\s*(몇\s*개|몇개|몇가지|몇 건|얼마나|수)\s*(정책|개|건)", user):
+                try:
+                    count = chain.retriever.vectorstore._collection.count()
+                    print(f"\nBot:\n현재 총 {count}개의 정책이 등록되어 있습니다.\n")
+                except Exception as e:
+                    print(f"\nBot:\n정책 수를 불러오는 데 문제가 발생했습니다: {e}\n")
+                print("─" * 60)
+                continue
+
+        # RAG + 필터 기반 검색
+        res = chain.invoke({"question": user})
         docs = filter_docs(res["source_documents"], user, region, interests)
 
+        # ───────────────────────────── #
+        # Fallback: 유사도 기반 top-3 재검색
+        # ───────────────────────────── #
         if not docs:
-            # 폴백: 유사도 top‑3 재검색
             docs = chain.retriever.vectorstore.similarity_search(user, k=3)
-            print("\nBot:\n", res["answer"], "\n")
+
+        # context 기반 응답 생성 (문서가 있을 경우에만)
+        if docs:
+            context = "\n\n".join([d.page_content for d in docs])
+            refined_response = llm.invoke(
+                combine_prompt.format_prompt(
+                    context=context,
+                    question=user
+                ).to_messages()
+            )
+            print("\nBot:\n", refined_response.content, "\n")
         else:
-            print("\nBot:\n", res["answer"], "\n")
+            print("\nBot:\n해당 질문에 대한 정책 정보를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.\n")
 
         print("─" * 60)
-
