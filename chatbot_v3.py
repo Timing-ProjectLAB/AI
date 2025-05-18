@@ -4,7 +4,7 @@
 # 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
 import os, re, json
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
@@ -17,6 +17,23 @@ from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 
+# ─────────────────────────────────── #
+# 0. 보조 함수 – 질의 재구성
+# ─────────────────────────────────── #
+
+def build_query(base_prompt: str,
+                age: Optional[int],
+                region: Optional[str],
+                interests: Optional[List[str]]) -> str:
+    """저장된 정보를 엮어 RAG용 자연어 질의 문자열 생성"""
+    parts: List[str] = [base_prompt]
+    if region:
+        parts.append(f"{region} 거주")
+    if age:
+        parts.append(f"{age}세")
+    if interests:
+        parts.append(f"관심사 {', '.join(interests)}")
+    return " ".join(parts)
 # ─────────────────────────────────── #
 # 1. 관심사 · 지역 맵
 # ─────────────────────────────────── #
@@ -216,27 +233,43 @@ def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) ->
 # ─────────────────────────────────── #
 # 4. 사용자 입력 파싱
 # ─────────────────────────────────── #
-def parse_user_input(text: str) -> Tuple[int, str, List[str]]:
-    age = 0
-    if m := re.search(r"(?:만\\s*)?(\\d{2})\\s*(?:세|살)", text):
+from typing import Tuple, Optional, List
+
+def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[List[str]]]:
+    age = None
+    if m := re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text):
         age = int(m.group(1))
 
-    region = ""
+    region = None
     for std_r, keywords in REGION_KEYWORDS.items():
         if any(k in text for k in keywords):
             region = std_r
             break
 
-    if not region:
-        for std_r, kws in REGION_MAPPING.items():
-            if any(k in text for k in kws):
-                region = std_r
-                break
+    interests = None
+    matches = [std_i for std_i, kws in INTEREST_MAPPING.items() if any(k in text for k in kws)]
+    if matches:
+        interests = matches
 
-    interests = [
-        std_i for std_i, kws in INTEREST_MAPPING.items() if any(k in text for k in kws)
-    ]
     return age, region, interests
+
+# 5. 정보 누락 확인 함수 추가
+# ─────────────────────────────────── #
+def missing_info(age, region, interests) -> List[str]:
+    needs = []
+    if age is None:
+        needs.append("나이")
+    if region is None:
+        needs.append("지역")
+    if not interests or len(interests) == 0:
+        needs.append("관심사")
+    return needs
+
+
+def classify_user_type(text: str) -> str:
+    known = ["청년내일채움공제", "도약계좌", "구직활동지원금", "국민취업지원제도", "정책명"]
+    return "policy_expert" if any(kw in text for kw in known) else "policy_novice"
+# ─────────────────────────────────── #
 
 
 # ─────────────────────────────────── #
@@ -378,42 +411,72 @@ def filter_docs(docs, user_text: str, region: str, interests: List[str]):
 # ─────────────────────────────────── #
 def console_chat(chain, llm):
     print("(Ctrl+C 종료)\n")
+
+    stored_age: Optional[int] = None
+    stored_region: Optional[str] = None
+    stored_interests: Optional[List[str]] = None
+
     while True:
         user = input("You: ").strip()
+        if user.lower() in ["초기화", "reset", "처음"]:
+            stored_age = stored_region = stored_interests = None
+            print("\nBot:\n사용자 정보를 초기화했습니다. 다시 입력해 주세요.\n")
+            continue
+
+        user_type = classify_user_type(user)
         age, region, interests = parse_user_input(user)
 
-        # 사용자 조건이 없는 경우에만 메타 질문으로 인식
-        if age == 0 and not region and not interests:
-            if re.search(r"(총|전체)?\s*(몇\s*개|몇개|몇가지|몇 건|얼마나|수)\s*(정책|개|건)", user):
-                try:
-                    count = chain.retriever.vectorstore._collection.count()
-                    print(f"\nBot:\n현재 총 {count}개의 정책이 등록되어 있습니다.\n")
-                except Exception as e:
-                    print(f"\nBot:\n정책 수를 불러오는 데 문제가 발생했습니다: {e}\n")
+        # 누적 저장: None이 아닌 경우만 업데이트
+        if age is not None:
+            stored_age = age
+        if region is not None:
+            stored_region = region
+        if interests is not None:
+            stored_interests = interests
+
+        # 디버그
+        print(f"[DEBUG] age={age}, region={region}, interests={interests}")
+        print(f"[DEBUG] stored_age={stored_age}, stored_region={stored_region}, stored_interests={stored_interests}")
+
+        # 정보 부족 시(초보자)
+        if user_type == "policy_novice":
+            needs = missing_info(stored_age, stored_region, stored_interests)
+            if needs:
+                print(f"\nBot:\n{' · '.join(needs)} 정보를 알려주시면 더 정확한 정책 추천이 가능합니다.\n")
                 print("─" * 60)
                 continue
 
-        # RAG + 필터 기반 검색
-        res = chain.invoke({"question": user})
-        docs = filter_docs(res["source_documents"], user, region, interests)
-
-        # ───────────────────────────── #
-        # Fallback: 유사도 기반 top-3 재검색
-        # ───────────────────────────── #
-        if not docs:
-            docs = chain.retriever.vectorstore.similarity_search(user, k=3)
-
-        # context 기반 응답 생성 (문서가 있을 경우에만)
-        if docs:
-            context = "\n\n".join([d.page_content for d in docs])
-            refined_response = llm.invoke(
-                combine_prompt.format_prompt(
-                    context=context,
-                    question=user
-                ).to_messages()
-            )
-            print("\nBot:\n", refined_response.content, "\n")
+        # 질의 재구성
+        if user_type == "policy_expert":
+            question_for_chain = user
+            question_for_llm = user  # 전문가는 원래 입력 사용
         else:
-            print("\nBot:\n해당 질문에 대한 정책 정보를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.\n")
+            question_for_chain = build_query(
+                base_prompt="청년 정책 추천 요청",
+                age=stored_age,
+                region=stored_region,
+                interests=stored_interests
+            )
+            question_for_llm = f"사용자는 {stored_age}세, {stored_region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
+        # RAG 호출
+        res = chain.invoke({"question": question_for_chain})
+
+        if user_type == "policy_expert":
+            docs = res["source_documents"]
+        else:
+            docs = filter_docs(res["source_documents"], question_for_chain,
+                               stored_region, stored_interests or [])
+            if not docs:
+                docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=3)
+
+        # 답변
+        if docs:
+            context = "\n\n".join(d.page_content for d in docs)
+            resp = llm.invoke(
+                combine_prompt.format_prompt(context=context, question=question_for_llm).to_messages()
+            )
+            print(f"\nBot:\n{resp.content}\n")
+        else:
+            print("\nBot:\n정책 정보를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.\n")
 
         print("─" * 60)
