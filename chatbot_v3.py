@@ -187,52 +187,88 @@ KEYWORDS = [
 CATEGORIES = ["일자리", "복지문화", "참여권리", "교육", "주거"]
 
 def extract_keywords(text: str) -> List[str]:
-    """문장에서 KEYWORDS 중 포함된 항목 반환"""
-    return [kw for kw in KEYWORDS if kw in text]
+    """사전 키워드 + 한글 형태소 기반 간이 추출"""
+    hits = [kw for kw in KEYWORDS if kw in text]
+    # 보강: 2글자 이상 명사 빈도수 상위 5개 자동 추출(간단 regex)
+    tokens = re.findall(r"[가-힣]{2,}", text)
+    freq = {}
+    for t in tokens:
+        freq[t] = freq.get(t, 0) + 1
+    sorted_extra = sorted((w for w in freq if w not in hits),
+                          key=lambda w: freq[w],
+                          reverse=True)[:5]
+    return hits + sorted_extra
 
 def extract_categories(cat_field: str) -> List[str]:
-    """쉼표(,)로 구분된 카테고리 문자열 → 유효 카테고리 배열"""
     if not cat_field:
         return []
-    parts = [c.strip() for c in cat_field.split(",")]
-    return [p for p in parts if p in CATEGORIES]
+    return [c.strip() for c in cat_field.split(",") if c.strip() in CATEGORIES]
 
 # ─────────────────────────────────── #
-# 3. 벡터스토어 로드/생성
+# 3. 벡터스토어 로드/생성 (강화 버전)
 # ─────────────────────────────────── #
-def load_or_build_vectorstore(json_path: str, persist_dir: str, api_key: str) -> Chroma:
+def load_or_build_vectorstore(json_path: str,
+                              persist_dir: str,
+                              api_key: str) -> Chroma:
+    """
+    1) persist_dir 에 Chroma DB가 이미 있으면 그대로 로드
+    2) 없으면 json_path(정책 리스트)를 읽어 Document 로 변환 후 Chroma DB 구축
+    """
     os.environ["OPENAI_API_KEY"] = api_key
     embedding = OpenAIEmbeddings()
 
+    # 1) 기존 DB 재사용
     if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        return Chroma(persist_directory=persist_dir, embedding_function=embedding)
+        return Chroma(persist_directory=persist_dir,
+                      embedding_function=embedding)
 
+    # 2) JSON → Document 변환
     with open(json_path, encoding="utf-8") as f:
         policies = json.load(f)
 
     docs: List[Document] = []
     for p in policies:
+        # (1) 본문 텍스트
         text = (
             f"정책명: {p['title']}\n"
-            f"지원대상: {p.get('min_age', 0)}세~{p.get('max_age', 99)}세 / 지역 {', '.join(p['region_name'])}\n"
-            f"혜택: {p.get('support_content','')}\n"
-            f"신청방법: {p.get('apply_method','')}\n"
-            f"설명: {p.get('description','')}\n"
-            f"링크: {p.get('apply_url','')}"
+            f"지원대상: "
+            f"{int(p.get('min_age', 0))}세~{int(p.get('max_age', 99))}세 / "
+            f"지역 {', '.join(p.get('region_name', []))}\n"
+            f"소득 분위: {p.get('income_condition', '제한 없음')}\n"
+            f"혜택: {p.get('support_content', '')}\n"
+            f"신청방법: {p.get('apply_method', '')}\n"
+            f"설명: {p.get('description', '')}\n"
+            f"링크: {p.get('apply_url', '')}"
         )
+
+        # (2) 키워드 병합: JSON 원본 + 자동 추출
+        merged_keywords = list(set(
+            p.get("keywords", []) + extract_keywords(text)
+        ))
+
+        # (3) 메타데이터
         docs.append(Document(
             page_content=text,
             metadata={
-                "region": ", ".join(p["region_name"]),
-                "categories": extract_categories(p.get("category", "")),
-                "keywords":   extract_keywords(text)
+                "policy_id":        p.get("policy_id"),
+                "title":            p["title"],
+                "region":           ", ".join(p.get("region_name", [])),
+                "categories":       extract_categories(p.get("category", "")),
+                "keywords":         merged_keywords,
+                "min_age":          int(p.get("min_age", 0)),
+                "max_age":          int(p.get("max_age", 99)),
+                "income_condition": p.get("income_condition", "제한 없음"),
+                "apply_period":     p.get("apply_period", ""),   # YYYYMMDD~YYYYMMDD
             }
         ))
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+    # 3) 분할 & 임베딩
+    splitter   = RecursiveCharacterTextSplitter(chunk_size=1000,
+                                                chunk_overlap=100)
     split_docs = splitter.split_documents(docs)
 
-    vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+    vectordb   = Chroma(persist_directory=persist_dir,
+                        embedding_function=embedding)
     vectordb.add_documents(split_docs)
     vectordb.persist()
     return vectordb
@@ -291,11 +327,12 @@ SYSTEM = SystemMessagePromptTemplate.from_template("""
 2. 조건에 부합하는 정책을 최소 3건 추천합니다.
    - 조건이 불충분하면 조회량 상위 3건을 제안합니다.
 3. 각 추천에 대해 근거 문서의 ID 또는 URL을 함께 제공합니다.
+4. 각 정책은 소득 분위 조건을 함께 표시하세요.
 
 [OUTPUT FORMAT - MARKDOWN]
-- **정책명**: 지원내용 요약 (출처: 문서ID)
-- **정책명**: 지원내용 요약 (출처: 문서ID)
-- **정책명**: 지원내용 요약 (출처: 문서ID)
+- **정책명** (소득: ○○ : 지원내용 요약 (출처: 문서ID)
+- **정책명** (소득: ○○ : 지원내용 요약 (출처: 문서ID)
+- **정책명** (소득: ○○ : 지원내용 요약 (출처: 문서ID)
 
 [EXCEPTIONS]
 - 정책 미발견 시:  
@@ -361,9 +398,10 @@ def jaccard_similarity(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def filter_docs(docs, user_text: str, region: str, interests: List[str]):
+def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List[str]):
     """
     docs        : LangChain Document 리스트
+    user_age    : 나이 조건
     user_text   : 사용자가 입력한 원문
     region      : 파싱된 표준 지역(예: '서울')
     interests   : 파싱된 관심사 리스트(예: ['창업', '주거'])
@@ -373,6 +411,14 @@ def filter_docs(docs, user_text: str, region: str, interests: List[str]):
     interests_set = set(interests)
 
     for d in docs:
+        # ─────────────────────── #
+        # 0. 나이 필터 : 메타데이터가 없다면 통과
+        # ─────────────────────── #
+        min_age = d.metadata.get("min_age", 0)
+        max_age = d.metadata.get("max_age",999)
+        if user_age not in range(min_age, max_age + 1):
+            continue
+
         # ─────────────────────── #
         # 1. 지역 점수 (R: 0 | 0.5 | 1)
         # ─────────────────────── #
@@ -464,17 +510,32 @@ def console_chat(chain, llm):
                 region=stored_region,
                 interests=stored_interests
             )
-            question_for_llm = f"사용자는 {stored_age}세, {stored_region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
+            question_for_llm = f"사용자는 {stored_age}세, {region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
         # RAG 호출
         res = chain.invoke({"question": question_for_chain})
 
         if user_type == "policy_expert":
             docs = res["source_documents"]
         else:
-            docs = filter_docs(res["source_documents"], question_for_chain,
-                               stored_region, stored_interests or [])
+            docs = filter_docs(
+                res["source_documents"], 
+                user_age=stored_age,
+                user_text=question_for_chain,
+                region = stored_region,
+                interests= stored_interests or []
+                )
             if not docs:
-                docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=3)
+                # 1차 벡터 검색
+                fallback_docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=5)
+    
+                # 2차 관심사 필터링 (예: '운동' 포함된 정책만 통과)
+                if stored_interests:
+                    fallback_docs = [
+                        d for d in fallback_docs
+                        if any(c in d.metadata.get("categories", []) for c in stored_interests)
+                    ]
+    
+                docs = fallback_docs[:3]  # 최대 3건까지만
 
         # 답변
         if docs:
