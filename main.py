@@ -12,8 +12,8 @@ def main():
     PERSIST_DIR = "./chroma_policies"
 
     vectordb  = load_or_build_vectorstore(JSON_PATH, PERSIST_DIR, api_key)
-    rag_chain = create_rag_chain(vectordb, api_key)
-    console_chat(rag_chain)
+    rag_chain, llm = create_rag_chain(vectordb, api_key)
+    console_chat(rag_chain, llm)
 
 if __name__ == "__main__":
     main()
