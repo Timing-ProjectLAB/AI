@@ -459,6 +459,57 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
 
     # 점수 높은 순 정렬 후 Document 리스트만 반환
     return [d for _, d in sorted(filtered, key=lambda x: x[0], reverse=True)]
+
+# ─────────────────────────────────── #
+# 9. 관심사 세부 분류 흐름 유도 (LLM 기반)
+# ─────────────────────────────────── #
+SUB_INTEREST_MAPPING = {
+    "취업": {
+        "면접준비": ["모의면접", "면접복장", "이력서 클리닉", "증명사진", "정장 대여"],
+        "역량강화": ["직업훈련", "직무교육", "취업기술 향상", "잡케어", "자격증"],
+        "현장경험": ["일 경험", "인턴십", "현장실습", "기업 연계 프로젝트"],
+        "구직지원금": ["구직촉진수당", "취업성공수당", "취업장려금", "활동비 지원"],
+        "고용연계": ["채용연계", "공공기관 채용", "청년채용 연계사업"]
+    },
+    "창업": {
+        "멘토링·상담": ["창업상담", "창업컨설팅", "BM모델", "법률·회계", "세무지원"],
+        "사업계획·기획": ["사업계획서 작성", "아이디어 고도화", "창업 R&D", "아이템 발굴"],
+        "자금지원": ["금리지원", "보증금", "융자", "창업자금"],
+        "창업교육": ["창업 교육", "창업포럼", "창업 아카데미", "네트워킹"]
+    },
+    "운동": {
+        "건강관리": ["헬스케어", "건강검진", "건강서비스", "의료서비스"],
+        "체육활동": ["피트니스", "요가", "스포츠센터", "체육관"],
+        "정신건강": ["심리상담", "정서지원", "스트레스 완화", "우울증 지원"]
+    },
+    "주거": {
+        "임대료지원": ["월세지원", "임대료 보조", "공공임대주택", "주거바우처"],
+        "주택구입·대출": ["주택 대출", "전세 대출", "보증금 지원"],
+        "주택개보수": ["주택정비", "리모델링", "빈집 활용"]
+    }
+}
+
+# 세부 관심사 질문 유도 함수 (대화형 방식, 예시 동적 반영)
+def prompt_sub_interest(main_interest: str) -> Optional[str]:
+    sub_map = SUB_INTEREST_MAPPING.get(main_interest)
+    if not sub_map:
+        return None
+
+    print(f"\nBot:\n{main_interest}과 관련해 아래와 같은 지원이 있어요:")
+    suggestions = list(sub_map.keys())
+    for idx, key in enumerate(suggestions, 1):
+        example_keywords = ", ".join(sub_map[key][:2])
+        print(f"- {key}: {example_keywords} 관련 지원")
+
+    example_hint = ", ".join(suggestions[:2])
+    print(f"\n특별히 궁금한 것이 있으신가요? (예: {example_hint} 등)")
+    sel = input("관심 있는 내용을 적어주세요: ").strip()
+    for key in suggestions:
+        if key in sel:
+            return key
+    print("입력 내용을 바탕으로 특정 항목을 찾을 수 없었어요. 일반 추천을 진행할게요.")
+    return None
+
 # ─────────────────────────────────── #
 # 8. 콘솔 채팅
 # ─────────────────────────────────── #
@@ -491,6 +542,14 @@ def console_chat(chain, llm):
         print(f"[DEBUG] age={age}, region={region}, interests={interests}")
         print(f"[DEBUG] stored_age={stored_age}, stored_region={stored_region}, stored_interests={stored_interests}")
 
+        # 세부 관심사 유도
+        if stored_interests and len(stored_interests) == 1:
+            main_interest = stored_interests[0]
+            sub_interest = prompt_sub_interest(main_interest)
+            if sub_interest:
+                stored_interests = [sub_interest]
+                print(f"\n[DEBUG] 세부 관심사 적용: {stored_interests}")
+
         # 정보 부족 시(초보자)
         if user_type == "policy_novice":
             needs = missing_info(stored_age, stored_region, stored_interests)
@@ -502,7 +561,7 @@ def console_chat(chain, llm):
         # 질의 재구성
         if user_type == "policy_expert":
             question_for_chain = user
-            question_for_llm = user  # 전문가는 원래 입력 사용
+            question_for_llm = user
         else:
             question_for_chain = build_query(
                 base_prompt="청년 정책 추천 요청",
@@ -510,7 +569,8 @@ def console_chat(chain, llm):
                 region=stored_region,
                 interests=stored_interests
             )
-            question_for_llm = f"사용자는 {stored_age}세, {region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
+            question_for_llm = f"사용자는 {stored_age}세, {stored_region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
+
         # RAG 호출
         res = chain.invoke({"question": question_for_chain})
 
@@ -518,24 +578,21 @@ def console_chat(chain, llm):
             docs = res["source_documents"]
         else:
             docs = filter_docs(
-                res["source_documents"], 
+                res["source_documents"],
                 user_age=stored_age,
                 user_text=question_for_chain,
-                region = stored_region,
-                interests= stored_interests or []
-                )
+                region=stored_region,
+                interests=stored_interests or []
+            )
             if not docs:
                 # 1차 벡터 검색
                 fallback_docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=5)
-    
-                # 2차 관심사 필터링 (예: '운동' 포함된 정책만 통과)
                 if stored_interests:
                     fallback_docs = [
                         d for d in fallback_docs
                         if any(c in d.metadata.get("categories", []) for c in stored_interests)
                     ]
-    
-                docs = fallback_docs[:3]  # 최대 3건까지만
+                docs = fallback_docs[:3]
 
         # 답변
         if docs:
