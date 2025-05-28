@@ -16,7 +16,7 @@ from langchain.prompts import (
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
+from tqdm import tqdm
 # ─────────────────────────────────── #
 # 0. 보조 함수 – 질의 재구성
 # ─────────────────────────────────── #
@@ -210,29 +210,28 @@ def extract_categories(cat_field: str) -> List[str]:
 def load_or_build_vectorstore(json_path: str,
                               persist_dir: str,
                               api_key: str) -> Chroma:
-    """
-    1) persist_dir 에 Chroma DB가 이미 있으면 그대로 로드
-    2) 없으면 json_path(정책 리스트)를 읽어 Document 로 변환 후 Chroma DB 구축
-    """
     os.environ["OPENAI_API_KEY"] = api_key
     embedding = OpenAIEmbeddings()
 
-    # 1) 기존 DB 재사용
     if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        return Chroma(persist_directory=persist_dir,
-                      embedding_function=embedding)
+        return Chroma(persist_directory=persist_dir, embedding_function=embedding)
 
-    # 2) JSON → Document 변환
     with open(json_path, encoding="utf-8") as f:
         policies = json.load(f)
 
-    docs: List[Document] = []
-    for p in policies:
-        # (1) 본문 텍스트
+    def safe_int(val, default=0):
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return default
+
+    splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+    vectordb = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+
+    for p in tqdm(policies, desc="Vectorizing policies"):
         text = (
             f"정책명: {p['title']}\n"
-            f"지원대상: "
-            f"{int(p.get('min_age', 0))}세~{int(p.get('max_age', 99))}세 / "
+            f"지원대상: {safe_int(p.get('min_age'))}세~{safe_int(p.get('max_age'), 99)}세 / "
             f"지역 {', '.join(p.get('region_name', []))}\n"
             f"소득 분위: {p.get('income_condition', '제한 없음')}\n"
             f"혜택: {p.get('support_content', '')}\n"
@@ -241,35 +240,23 @@ def load_or_build_vectorstore(json_path: str,
             f"링크: {p.get('apply_url', '')}"
         )
 
-        # (2) 키워드 병합: JSON 원본 + 자동 추출
-        merged_keywords = list(set(
-            p.get("keywords", []) + extract_keywords(text)
-        ))
+        merged_keywords = list(set(p.get("keywords", []) + extract_keywords(text)))
 
-        # (3) 메타데이터
-        docs.append(Document(
-            page_content=text,
-            metadata={
-                "policy_id":        p.get("policy_id"),
-                "title":            p["title"],
-                "region":           ", ".join(p.get("region_name", [])),
-                "categories":       extract_categories(p.get("category", "")),
-                "keywords":         merged_keywords,
-                "min_age":          int(p.get("min_age", 0)),
-                "max_age":          int(p.get("max_age", 99)),
-                "income_condition": p.get("income_condition", "제한 없음"),
-                "apply_period":     p.get("apply_period", ""),   # YYYYMMDD~YYYYMMDD
-            }
-        ))
+        metadata = {
+            "policy_id":        p.get("policy_id"),
+            "title":            p["title"],
+            "region":           ", ".join(p.get("region_name", [])),
+            "categories":       ", ".join(extract_categories(p.get("category", ""))),  # ✅ 수정
+            "keywords":         ", ".join(merged_keywords),  # ✅ 수정
+            "min_age":          safe_int(p.get("min_age")),
+            "max_age":          safe_int(p.get("max_age"), 99),
+            "income_condition": p.get("income_condition", "제한 없음"),
+            "apply_period":     p.get("apply_period", ""),}   
 
-    # 3) 분할 & 임베딩
-    splitter   = RecursiveCharacterTextSplitter(chunk_size=1000,
-                                                chunk_overlap=100)
-    split_docs = splitter.split_documents(docs)
+        chunks = splitter.split_text(text)
+        documents = [Document(page_content=chunk, metadata=metadata) for chunk in chunks]
+        vectordb.add_documents(documents)
 
-    vectordb   = Chroma(persist_directory=persist_dir,
-                        embedding_function=embedding)
-    vectordb.add_documents(split_docs)
     vectordb.persist()
     return vectordb
 
@@ -332,15 +319,13 @@ SYSTEM = SystemMessagePromptTemplate.from_template("""
 6. 조건이 명확하지 않으면 조회량이 많은 전국 공통 정책 3건을 대신 추천하세요.
 
 [OUTPUT FORMAT - MARKDOWN]
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (출처: 문서ID)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (출처: 문서ID)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (출처: 문서ID)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
 
-[EXCEPTIONS]
-- 정책 미발견 시:  
-  “해당 조건에 맞는 정책이 없습니다. 대신 전국 공통 정책 3건을 추천합니다.”  
-- 입력 정보 부족 시:  
-  “○○ 정보를 추가로 알려주시면 더 정확한 추천이 가능합니다.”
+[EXCEPTION]
+- 조건에 맞는 정책이 없을 경우:
+    대신 전국 공통 정책 3건을 출력하세요.
 
 [EXAMPLE - NORMAL]
 - **청년내일채움공제** (소득: 제한 없음): 중소기업 근무 청년에게 목돈 마련 지원 — 나이와 소득 조건 모두 부합 (출처: policy_123)
@@ -588,12 +573,19 @@ def console_chat(chain, llm):
             )
             if not docs:
                 # 1차 벡터 검색
-                fallback_docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=5)
+                fallback_docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=10)
+
+            # 2차 관심사 필터링 (예: '주거' 포함된 정책만 통과)
                 if stored_interests:
                     fallback_docs = [
                         d for d in fallback_docs
-                        if any(c in d.metadata.get("categories", []) for c in stored_interests)
-                    ]
+                        if any(c in d.metadata.get("categories", "").split(",") for c in stored_interests)
+                        ]
+
+                # 정책이 아예 없다면 전체 중에서 상위 3건
+                if not fallback_docs:
+                    fallback_docs = chain.retriever.vectorstore.similarity_search("전국 공통 청년 정책", k=3)
+
                 docs = fallback_docs[:3]
 
         # 답변
@@ -604,6 +596,6 @@ def console_chat(chain, llm):
             )
             print(f"\nBot:\n{resp.content}\n")
         else:
-            print("\nBot:\n정책 정보를 찾을 수 없습니다. 더 구체적으로 입력해 주세요.\n")
+            print("\nBot:\n조건에 맞는 정책이 없습니다. 기본 추천을 보여드립니다.\n")
 
         print("─" * 60)
