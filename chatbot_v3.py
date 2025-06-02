@@ -231,6 +231,7 @@ def load_or_build_vectorstore(json_path: str,
     for p in tqdm(policies, desc="Vectorizing policies"):
         text = (
             f"정책명: {p['title']}\n"
+            f"정책ID: {p.get('policy_id')}\n"
             f"지원대상: {safe_int(p.get('min_age'))}세~{safe_int(p.get('max_age'), 99)}세 / "
             f"지역 {', '.join(p.get('region_name', []))}\n"
             f"소득 분위: {p.get('income_condition', '제한 없음')}\n"
@@ -239,9 +240,11 @@ def load_or_build_vectorstore(json_path: str,
             f"설명: {p.get('description', '')}\n"
             f"링크: {p.get('apply_url', '')}"
         )
-
-        merged_keywords = list(set(p.get("keywords", []) + extract_keywords(text)))
-
+    
+        existing_keywords = p.get("keywords", "")
+        if isinstance(existing_keywords, str):
+            existing_keywords = [kw.strip() for kw in existing_keywords.split(",") if kw.strip()]
+        merged_keywords = list(set(existing_keywords + extract_keywords(text)))
         metadata = {
             "policy_id":        p.get("policy_id"),
             "title":            p["title"],
@@ -319,9 +322,9 @@ SYSTEM = SystemMessagePromptTemplate.from_template("""
 6. 조건이 명확하지 않으면 조회량이 많은 전국 공통 정책 3건을 대신 추천하세요.
 
 [OUTPUT FORMAT - MARKDOWN]
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
+- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
 
 [EXCEPTION]
 - 조건에 맞는 정책이 없을 경우:

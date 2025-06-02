@@ -8,7 +8,7 @@ import shutil
 def main():
     load_dotenv()
     api_key = os.getenv("OPENAI_API_KEY", "")
-    JSON_PATH   = "ms_v3_filled_urls.json"
+    JSON_PATH   = "ms_v3_keywords_added.json"
     PERSIST_DIR = "./chroma_policies"
     force_rebuild = False #True일 경우 항상 재빌드
     if force_rebuild and os.path.exists(PERSIST_DIR):
