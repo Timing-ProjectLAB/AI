@@ -1,19 +1,55 @@
 import json
-import pandas as pd
+from collections import Counter
+import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
+import os
 
-# 1. JSON 로드
-with open('ms_v3_short.json', 'r', encoding='utf-8') as f:
+# 👉 한글 폰트 설정 (Mac 기준)
+plt.rcParams['font.family'] = 'AppleGothic'  # macOS용
+plt.rcParams['axes.unicode_minus'] = False   # 마이너스 기호 깨짐 방지
+
+# JSON 파일 로드
+with open("final_data.json", encoding="utf-8") as f:
     data = json.load(f)
 
-# 2. DataFrame으로 변환
-df = pd.json_normalize(data)
+# category, keywords 추출
+categories = []
+keywords = []
 
-# 3. explode로 리스트 형태 필드 평탄화
-kw = df['keywords'].explode().dropna().unique().tolist()
-cat = df['category'].dropna().unique().tolist()
-reg = df['region_name'].explode().dropna().unique().tolist()
+for item in data:
+    cat = item.get("category")
+    if cat:
+        categories.append(cat)
 
-# 4. 출력
-print("키워드 목록:", kw)
-print("카테고리 목록:", cat)
-print("지역 목록:", reg)
+    kw_list = item.get("keywords")
+    if kw_list and isinstance(kw_list, list):
+        keywords.extend(kw_list)
+
+# 카운트
+category_counter = Counter(categories)
+keyword_counter = Counter(keywords)
+
+# 상위 10개 추출
+top_categories = category_counter.most_common(30)
+top_keywords = keyword_counter.most_common(30)
+
+cat_labels, cat_counts = zip(*top_categories)
+kw_labels, kw_counts = zip(*top_keywords)
+
+# 📊 Category 시각화
+plt.figure(figsize=(10, 6))
+plt.barh(cat_labels[::-1], cat_counts[::-1])
+plt.title("상위 30개 Category")
+plt.xlabel("빈도수")
+plt.ylabel("Category")
+plt.tight_layout()
+plt.show()
+
+# 📊 Keyword 시각화
+plt.figure(figsize=(10, 6))
+plt.barh(kw_labels[::-1], kw_counts[::-1])
+plt.title("상위 30개 Keywords")
+plt.xlabel("빈도수")
+plt.ylabel("Keyword")
+plt.tight_layout()
+plt.show()

@@ -1,7 +1,7 @@
 import json
 
 # 1. 정책 리스트 JSON 로드
-with open("ms_v3.json", encoding="utf-8") as f:
+with open("final_data1.json", encoding="utf-8") as f:
     policies = json.load(f)  # ← 여기가 리스트임!
 
 # 2. 지역 코드 ↔ 지역명 매핑 JSON
@@ -15,7 +15,7 @@ for policy in policies:
     policy["region_name"] = names
 
 # 4. 결과 저장
-with open("ms_v3_short.json", "w", encoding="utf-8") as f:
+with open("final_data1_short.json", "w", encoding="utf-8") as f:
     json.dump(policies, f, ensure_ascii=False, indent=2)
 
 print(f"[✔] 총 {len(policies)}건의 정책에 지역명 추가 완료.")
