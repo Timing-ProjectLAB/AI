@@ -1,5 +1,23 @@
-import re
+#!/usr/bin/env python3
+# chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
+# 실행: python3 chatbot.py
+# 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
+import os, re, json
+
+from typing import List, Tuple, Optional
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+from langchain.prompts import (
+    ChatPromptTemplate, 
+    SystemMessagePromptTemplate, 
+    HumanMessagePromptTemplate
+)
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tqdm import tqdm
 # 사용자 입력에서 정보 자동 추출 함수
 def extract_user_info(user_input: str):
     info = {"age": None, "region": None, "interests": [], "status": None, "income": None}
@@ -32,15 +50,7 @@ def extract_user_info(user_input: str):
         info["income"] = "고소득층"
 
     return info
-#!/usr/bin/env python3
-# chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
-# 실행: python3 chatbot.py
-# 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
-import os, re, json
-
-# 결과 출력 함수
-import json
 
 def print_result(idx, doc):
     result = {
@@ -48,19 +58,7 @@ def print_result(idx, doc):
         "answer": doc.page_content.strip()[:100] + "..."  # 간단 요약
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
-from typing import List, Tuple, Optional
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain.schema import Document
-from langchain.prompts import (
-    ChatPromptTemplate, 
-    SystemMessagePromptTemplate, 
-    HumanMessagePromptTemplate
-)
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from tqdm import tqdm
+
 # ─────────────────────────────────── #
 # 글로벌 임베딩 및 키워드 벡터DB (키워드 전용)
 # Load embedding function globally
@@ -506,7 +504,7 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
 
         if score >= MIN_SCORE:
             filtered.append((score, d))
-
+        
     # 점수 높은 순 정렬 후 Document 리스트만 반환
     return [d for _, d in sorted(filtered, key=lambda x: x[0], reverse=True)]
 
@@ -644,7 +642,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                         stored_interests.append(kw)
 
         print(f"[🔍 추론된 관심사] → {predicted_keywords}")
-        print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}")
+        print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}" )
 
         # ──────────────────────────────────────────────
         # 벡터 DB 유사 검색 - fallback 기반 검색 로직으로 대체
