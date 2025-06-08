@@ -61,7 +61,7 @@ category: 카테고리1, 카테고리2
 # ───────────────────────────────────── #
 # 3. JSON 파일 불러오기
 # ───────────────────────────────────── #
-with open("ms_v3_filled_urls.json", encoding="utf-8") as f:
+with open("FINAL.json", encoding="utf-8") as f:
     data = json.load(f)
 
 df = pd.json_normalize(data)
@@ -82,5 +82,5 @@ for i, row in tqdm(df.iterrows(), total=len(df), desc="🔍 GPT 키워드 생성
 df["keywords"] = [r[0] for r in results]
 df["category"] = [r[1] for r in results]
 
-with open("ms_v3_keywords_added.json", "w", encoding="utf-8") as f:
+with open("FINAL_key_cat.json", "w", encoding="utf-8") as f:
     json.dump(df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)

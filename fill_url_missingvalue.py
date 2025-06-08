@@ -4,11 +4,14 @@ import re
 import urllib.parse
 import requests
 from bs4 import BeautifulSoup
+from tqdm import tqdm
+
+tqdm.pandas()  # tqdm을 DataFrame에 적용 가능하게 설정
 
 # ───────────────────────────── #
 # 1. JSON 파일 로드
 # ───────────────────────────── #
-with open("ms_v3_short.json", "r", encoding="utf-8") as f:
+with open("final_data.json", "r", encoding="utf-8") as f:
     data = json.load(f)
 
 df = pd.json_normalize(data)
@@ -45,7 +48,7 @@ def search_policy_url(title):
         return ""
     return ""
 
-df["apply_url"] = df.apply(
+df["apply_url"] = df.progress_apply(
     lambda row: search_policy_url(row["title"]) if row["apply_url"] == "" and extract_url(row["apply_method"]) == "" else row["apply_url"],
     axis=1
 )
@@ -53,5 +56,5 @@ df["apply_url"] = df.apply(
 # ───────────────────────────── #
 # 4. 저장
 # ───────────────────────────── #
-with open("ms_v3_filled_urls.json", "w", encoding="utf-8") as f:
+with open("final_data_url.json", "w", encoding="utf-8") as f:
     json.dump(df.to_dict(orient="records"), f, ensure_ascii=False, indent=2)

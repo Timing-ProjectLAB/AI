@@ -1,9 +1,53 @@
+import re
+
+# 사용자 입력에서 정보 자동 추출 함수
+def extract_user_info(user_input: str):
+    info = {"age": None, "region": None, "interests": [], "status": None, "income": None}
+
+    # 나이 추출
+    age_match = re.search(r'(\d{2})\s*살', user_input)
+    if age_match:
+        info["age"] = int(age_match.group(1))
+
+    # 지역 추출
+    for region in ["서울", "부산", "대전", "광주", "강남구", "종로구"]:
+        if region in user_input:
+            info["region"] = region
+            break
+
+    # 관심사 사전 기반
+    interest_keywords = ["운동", "주거", "복지", "대출", "창업", "취업"]
+    info["interests"] = [kw for kw in interest_keywords if kw in user_input]
+
+    # 상태 추출
+    if "대학생" in user_input:
+        info["status"] = "대학생"
+    elif "취준생" in user_input or "취업 준비" in user_input:
+        info["status"] = "취업준비생"
+
+    # 소득
+    if "저소득" in user_input:
+        info["income"] = "저소득층"
+    elif "고소득" in user_input:
+        info["income"] = "고소득층"
+
+    return info
 #!/usr/bin/env python3
 # chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
 # 실행: python3 chatbot.py
 # 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
 import os, re, json
+
+# 결과 출력 함수
+import json
+
+def print_result(idx, doc):
+    result = {
+        "policy_id": doc.metadata.get("policy_id", f"unknown_{idx}"),
+        "answer": doc.page_content.strip()[:100] + "..."  # 간단 요약
+    }
+    print(json.dumps(result, ensure_ascii=False, indent=2))
 from typing import List, Tuple, Optional
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
@@ -18,6 +62,14 @@ from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm import tqdm
 # ─────────────────────────────────── #
+# 글로벌 임베딩 및 키워드 벡터DB (키워드 전용)
+# Load embedding function globally
+embedding = OpenAIEmbeddings()
+# Load keyword vectorstore (ensure it's built with keyword terms only)
+keyword_vectordb = Chroma(persist_directory="./kwdb", embedding_function=embedding)
+category_vectordb = Chroma(persist_directory="./categorydb", embedding_function=embedding)
+# Main policy vectorstore
+policy_vectordb = Chroma(persist_directory="./chroma_policies", embedding_function=embedding)
 # 0. 보조 함수 – 질의 재구성
 # ─────────────────────────────────── #
 
@@ -185,6 +237,14 @@ KEYWORDS = [
 ]
 
 CATEGORIES = ["일자리", "복지문화", "참여권리", "교육", "주거"]
+
+INTEREST_EXPANSION = {
+    "운동": ["생활체육", "운동처방", "운동용품 대여", "건강", "체력", "헬스"],
+    "창업": ["창업지원", "창업교육", "사업자등록", "스타트업"],
+    "취업": ["일자리", "직무교육", "인턴십", "일경험", "청년고용"],
+    "주거": ["임대", "청년주택", "보증금지원", "전세", "월세"],
+    "복지": ["심리상담", "정신건강", "건강검진", "생활비지원"]
+}
 
 def extract_keywords(text: str) -> List[str]:
     """사전 키워드 + 한글 형태소 기반 간이 추출"""
@@ -354,7 +414,7 @@ combine_prompt = ChatPromptTemplate.from_messages([
 # ─────────────────────────────────── #
 def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalChain:
     llm = ChatOpenAI(model_name="gpt-4o", temperature=0)
-    retriever = vectordb.as_retriever(search_kwargs={"k": 5})
+    retriever = vectordb.as_retriever(search_kwargs={"k": 30})
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         input_key="question",
@@ -503,102 +563,160 @@ def prompt_sub_interest(main_interest: str) -> Optional[str]:
 # ─────────────────────────────────── #
 # 8. 콘솔 채팅
 # ─────────────────────────────────── #
-def console_chat(chain, llm):
-    print("(Ctrl+C 종료)\n")
+def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, policy_vectordb=None):
+    print("\n챗봇이 시작되었습니다. 종료하려면 '종료'를 입력하세요.\n")
 
-    stored_age: Optional[int] = None
-    stored_region: Optional[str] = None
-    stored_interests: Optional[List[str]] = None
+    stored_age = None
+    stored_region = None
+    stored_interests = []
+
+    # Ensure vectordb refers to main policy vectorstore
+    vectordb = policy_vectordb if policy_vectordb is not None else policy_vectordb
+
+    def is_new_topic(predicted: list[str], stored: list[str]) -> bool:
+        return not any(kw in stored for kw in predicted)
 
     while True:
-        user = input("You: ").strip()
-        if user.lower() in ["초기화", "reset", "처음"]:
-            stored_age = stored_region = stored_interests = None
-            print("\nBot:\n사용자 정보를 초기화했습니다. 다시 입력해 주세요.\n")
+        user_input = input("You: ")
+        if user_input.strip().lower() in ["종료", "exit", "quit"]:
+            print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
+            break
+
+        # 사용자 입력에서 자동 정보 추출 및 출력
+        user_info = extract_user_info(user_input)
+        print(f"[🧠 자동 추출 정보] 나이: {user_info['age']}, 지역: {user_info['region']}, 관심사: {user_info['interests']}, 상태: {user_info['status']}, 소득: {user_info['income']}")
+
+        # 사용자 정보 누적 및 나이 추출(살 포함)
+        import re
+        age_match = re.search(r"(\d{2})\s*살", user_input)
+        if age_match:
+            stored_age = int(age_match.group(1))
+        # 기존 "세" 처리(복수 타입 지원)
+        if "세" in user_input:
+            match = re.search(r"(\d{2})세", user_input)
+            if match:
+                stored_age = int(match.group(1))
+
+        if any(loc in user_input for loc in ["서울", "부산", "대전", "대구", "광주", "인천"]):
+            stored_region = next(loc for loc in ["서울", "부산", "대전", "대구", "광주", "인천"] if loc in user_input)
+
+        # 관심사 추론
+        predicted_keywords = None
+        embedding = None
+        if keyword_vectordb:
+            embedding = OpenAIEmbeddings()
+            query_vector = embedding.embed_query(user_input)
+            docs = keyword_vectordb.similarity_search_by_vector(query_vector, k=3)
+            if docs:
+                predicted_keywords = [doc.page_content for doc in docs]
+
+        if not predicted_keywords and category_vectordb:
+            if embedding is None:
+                embedding = OpenAIEmbeddings()
+            query_vector = embedding.embed_query(user_input)
+            docs = category_vectordb.similarity_search_by_vector(query_vector, k=2)
+            if docs:
+                predicted_keywords = [doc.page_content for doc in docs]
+
+        if not predicted_keywords:
+            from langchain.prompts import PromptTemplate
+            prompt = PromptTemplate.from_template("""
+            [시스템]
+            다음 문장에서 관련 있는 관심사를 추출하세요.
+            선택 가능한 항목: 창업, 취업, 금융, 복지, 교육, 공간, 문화예술
+
+            문장:
+            {input}
+
+            결과:
+            """)
+            response = llm.invoke(prompt.format(input=user_input).to_messages())
+            predicted_keywords = [i.strip() for i in response.content.split(",") if i.strip()]
+
+        # 관심사 초기화 조건 체크 및 저장
+        if predicted_keywords:
+            if is_new_topic(predicted_keywords, stored_interests):
+                print("🧹 기존 관심사를 초기화합니다.")
+                stored_interests = predicted_keywords
+            else:
+                for kw in predicted_keywords:
+                    if kw not in stored_interests:
+                        stored_interests.append(kw)
+
+        print(f"[🔍 추론된 관심사] → {predicted_keywords}")
+        print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}")
+
+        # ──────────────────────────────────────────────
+        # 벡터 DB 유사 검색 - fallback 기반 검색 로직으로 대체
+        # ──────────────────────────────────────────────
+        # 기존 retriever.invoke(user_input) 등은 사용하지 않음.
+        # vectordb는 chroma_policies 인스턴스여야 함.
+        # Fallback 검색 - 유사한 정책이라도 추천
+        filters_keywords_only = {
+            "categories": {"$in": stored_interests}
+        } if stored_interests else None
+        if vectordb is not None:
+            results = vectordb.similarity_search(user_input, k=3, filter=filters_keywords_only)
+            if results:
+                # Output using print_result for each doc
+                for idx, doc in enumerate(results, 1):
+                    print_result(idx, doc)
+            else:
+                results = vectordb.similarity_search(user_input, k=3)
+                for idx, doc in enumerate(results, 1):
+                    print_result(idx, doc)
+
+            # After displaying the retrieved documents, prompt for missing info or continue
+            if stored_age is None or stored_region is None:
+                missing = []
+                if stored_age is None:
+                    missing.append("나이")
+                if stored_region is None:
+                    missing.append("지역")
+                print(f"\n🤖 추가 정보를 알려주시면 더 정확한 정책을 추천해드릴 수 있어요! 👉 {', '.join(missing)} 정보를 입력해 주세요.")
+            else:
+                print("\n🤖 다른 관심사가 있으시면 말씀해 주세요! 예: 주거정책, 대출, 창업지원 등")
+        else:
+            print("❌ vectordb가 초기화되지 않았습니다. 정책 검색을 수행할 수 없습니다.")
+
+# ─────────────────────────────────── #
+# Helper: Fallback-based document retrieval
+# ─────────────────────────────────── #
+def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
+    filters = []
+
+    meta = {}
+    if region:
+        meta["region"] = {"$contains": region}
+    if age:
+        meta["min_age"] = {"$lte": age}
+        meta["max_age"] = {"$gte": age}
+    if interests:
+        meta["categories"] = {"$in": interests}
+    filters.append(meta)
+
+    if "region" in meta:
+        f2 = meta.copy()
+        del f2["region"]
+        filters.append(f2)
+
+    if "min_age" in meta and "max_age" in meta:
+        f3 = meta.copy()
+        del f3["min_age"]
+        del f3["max_age"]
+        filters.append(f3)
+
+    if "categories" in meta:
+        filters.append({"categories": {"$in": interests}})
+
+    filters.append({})  # no filters
+
+    for f in filters:
+        try:
+            docs = vectordb.similarity_search(query, filter=f, k=k)
+            if docs:
+                return docs
+        except Exception as e:
             continue
 
-        user_type = classify_user_type(user)
-        age, region, interests = parse_user_input(user)
-
-        # 누적 저장: None이 아닌 경우만 업데이트
-        if age is not None:
-            stored_age = age
-        if region is not None:
-            stored_region = region
-        if interests is not None:
-            stored_interests = interests
-
-        # 디버그
-        print(f"[DEBUG] age={age}, region={region}, interests={interests}")
-        print(f"[DEBUG] stored_age={stored_age}, stored_region={stored_region}, stored_interests={stored_interests}")
-
-        # 세부 관심사 유도
-        if stored_interests and len(stored_interests) == 1:
-            main_interest = stored_interests[0]
-            sub_interest = prompt_sub_interest(main_interest)
-            if sub_interest:
-                stored_interests = [sub_interest]
-                print(f"\n[DEBUG] 세부 관심사 적용: {stored_interests}")
-
-        # 정보 부족 시(초보자)
-        if user_type == "policy_novice":
-            needs = missing_info(stored_age, stored_region, stored_interests)
-            if needs:
-                print(f"\nBot:\n{' · '.join(needs)} 정보를 알려주시면 더 정확한 정책 추천이 가능합니다.\n")
-                print("─" * 60)
-                continue
-
-        # 질의 재구성
-        if user_type == "policy_expert":
-            question_for_chain = user
-            question_for_llm = user
-        else:
-            question_for_chain = build_query(
-                base_prompt="청년 정책 추천 요청",
-                age=stored_age,
-                region=stored_region,
-                interests=stored_interests
-            )
-            question_for_llm = f"사용자는 {stored_age}세, {stored_region} 거주, 관심사 {', '.join(stored_interests)}입니다. 이 조건에 맞는 정책을 추천해 주세요."
-
-        # RAG 호출
-        res = chain.invoke({"question": question_for_chain})
-
-        if user_type == "policy_expert":
-            docs = res["source_documents"]
-        else:
-            docs = filter_docs(
-                res["source_documents"],
-                user_age=stored_age,
-                user_text=question_for_chain,
-                region=stored_region,
-                interests=stored_interests or []
-            )
-            if not docs:
-                # 1차 벡터 검색
-                fallback_docs = chain.retriever.vectorstore.similarity_search(question_for_chain, k=10)
-
-            # 2차 관심사 필터링 (예: '주거' 포함된 정책만 통과)
-                if stored_interests:
-                    fallback_docs = [
-                        d for d in fallback_docs
-                        if any(c in d.metadata.get("categories", "").split(",") for c in stored_interests)
-                        ]
-
-                # 정책이 아예 없다면 전체 중에서 상위 3건
-                if not fallback_docs:
-                    fallback_docs = chain.retriever.vectorstore.similarity_search("전국 공통 청년 정책", k=3)
-
-                docs = fallback_docs[:3]
-
-        # 답변
-        if docs:
-            context = "\n\n".join(d.page_content for d in docs)
-            resp = llm.invoke(
-                combine_prompt.format_prompt(context=context, question=question_for_llm).to_messages()
-            )
-            print(f"\nBot:\n{resp.content}\n")
-        else:
-            print("\nBot:\n조건에 맞는 정책이 없습니다. 기본 추천을 보여드립니다.\n")
-
-        print("─" * 60)
+    return []
