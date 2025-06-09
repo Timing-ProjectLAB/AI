@@ -172,7 +172,10 @@ REGION_MAPPING = {
         "서울특별시 서대문구", "서울특별시 마포구", "서울특별시 양천구", "서울특별시 강서구",
         "서울특별시 구로구", "서울특별시 금천구", "서울특별시 영등포구", "서울특별시 동작구",
         "서울특별시 관악구", "서울특별시 서초구", "서울특별시 강남구", "서울특별시 송파구",
-        "서울특별시 강동구"
+        "서울특별시 강동구",
+        "서울",
+        "서울특별시",
+        "서울시"
     ],
     "경기": [
         "경기도 수원시장안구", "경기도 수원시권선구", "경기도 수원시팔달구", "경기도 수원시영통구",
@@ -268,6 +271,19 @@ REGION_MAPPING = {
     ]
 }
 
+# ---- 단일 키워드 및 'OO시' 변형 자동 추가 ----
+# 각 표준 지역명 자체(예: '서울', '경기')와 흔히 쓰는 '○○시' 변형을 REGION_MAPPING 리스트에 자동 포함시켜
+# 단일 키워드 입력도 인식하도록 확장합니다.
+for std_region, names in REGION_MAPPING.items():
+    # 1) 단일 표준 지역명 추가
+    if std_region not in names:
+        names.append(std_region)
+    # 2) '○○시' 변형 추가 (도 단위는 제외)
+    if not std_region.endswith("도") and not std_region.endswith("시"):
+        si_variant = f"{std_region}시"
+        if si_variant not in names:
+            names.append(si_variant)
+
 # 지역 이름 역매핑 (예: '여주시' → '경기')
 REVERSE_REGION_LOOKUP = {}
 for std_region, full_names in REGION_MAPPING.items():
@@ -276,6 +292,12 @@ for std_region, full_names in REGION_MAPPING.items():
         for token in tokens:
             if token not in REVERSE_REGION_LOOKUP:
                 REVERSE_REGION_LOOKUP[token] = std_region
+
+            # ‘여주시’ → ‘여주’처럼 접미사(시·군·구) 제거 버전도 매핑
+            core_tok = re.sub(r"(시|군|구)$", "", token)
+            if core_tok and core_tok not in REVERSE_REGION_LOOKUP:
+                REVERSE_REGION_LOOKUP[core_tok] = std_region
+
         # 전체 명칭도 직접 매핑
         if name not in REVERSE_REGION_LOOKUP:
             REVERSE_REGION_LOOKUP[name] = std_region
@@ -283,6 +305,8 @@ for std_region, full_names in REGION_MAPPING.items():
 # 추가: 단일 지명 토큰 매핑
 REVERSE_REGION_LOOKUP.setdefault("제주", "제주")
 REVERSE_REGION_LOOKUP.setdefault("제주도", "제주")
+REVERSE_REGION_LOOKUP.setdefault("서울", "서울")
+REVERSE_REGION_LOOKUP.setdefault("서울시", "서울")
 
 # ─────────────────────────────────── #
 # 2. 정책 키워드 · 카테고리
@@ -394,14 +418,17 @@ def clean_user_input(text: str) -> str:
 # 조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
 def normalize_korean_tokens(text: str) -> List[str]:
     """
-    조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
+    조사·행정구역 접미사(시·군·구) 제거 후 핵심 단어 추출
     """
     tokens = re.findall(r"[가-힣]{2,}", text)
     normalized = []
-    for token in tokens:
+    for tok in tokens:
         # 조사 제거
-        core = re.sub(r"(에|에서|에게|로|으로|의|를|을|이|가|은|는|도|만|이나|까지|부터)$", "", token)
-        normalized.append(core)
+        core = re.sub(r"(에|에서|에게|로|으로|의|를|을|이|가|은|는|도|만|이나|까지|부터)$", "", tok)
+        # 행정구역 접미사 제거
+        core = re.sub(r"(시|군|구)$", "", core)
+        if core and core not in normalized:
+            normalized.append(core)
     return normalized
 
 # 지역 추출 보조 함수
