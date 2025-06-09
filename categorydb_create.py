@@ -1,7 +1,12 @@
+import os
 import json
+from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings
+
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY", "")
 
 # 1. JSON 로드
 with open("FINAL_key_cat.json", encoding="utf-8") as f:
@@ -16,7 +21,7 @@ for item in data:
 
 # 3. 벡터 저장
 docs = [Document(page_content=cat, metadata={"type": "category"}) for cat in categories]
-embedding = OpenAIEmbeddings()
+embedding = OpenAIEmbeddings(openai_api_key=api_key)
 category_vectordb = Chroma.from_documents(
     documents=docs,
     embedding=embedding,

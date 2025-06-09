@@ -1,8 +1,13 @@
 # kwdb_create.py
+import os
 import json
+from dotenv import load_dotenv
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
 from langchain_openai import OpenAIEmbeddings
+
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY", "")
 
 # 1. JSON 파일 경로
 json_path = "FINAL_key_cat.json"
@@ -21,7 +26,7 @@ for item in data:
 docs = [Document(page_content=kw, metadata={"type": "keyword"}) for kw in unique_keywords]
 
 # 4. 임베딩 및 Chroma 저장
-embedding = OpenAIEmbeddings()  # OpenAI API 키 환경변수 필요
+embedding = OpenAIEmbeddings(openai_api_key=api_key)  # OpenAI API 키 환경변수 필요
 persist_dir = "./kwdb"
 
 vectordb = Chroma.from_documents(

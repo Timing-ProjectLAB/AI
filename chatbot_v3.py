@@ -64,6 +64,9 @@ from tqdm import tqdm
 # ─────────────────────────────────── #
 # 글로벌 임베딩 및 키워드 벡터DB (키워드 전용)
 # Load embedding function globally
+from dotenv import load_dotenv
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY", "")
 embedding = OpenAIEmbeddings()
 # Load keyword vectorstore (ensure it's built with keyword terms only)
 keyword_vectordb = Chroma(persist_directory="./kwdb", embedding_function=embedding)
