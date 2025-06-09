@@ -1,3 +1,8 @@
+# 추가: 코드 맨 위에 clean_text_for_matching 함수 정의
+import re
+
+def clean_text_for_matching(text):
+    return re.sub(r"[^\w\s]", "", text).replace("에", "").replace("에서", "").replace("인데", "").replace("야", "").strip()
 # ─────────────────────────────────── #
 # 정책 관련 질문 여부 판별 함수
 # ─────────────────────────────────── #
@@ -11,13 +16,19 @@ NON_POLICY_KEYWORDS = [
 
 def is_policy_related_question(text: str) -> bool:
     import re
+    # uses global clean_text_for_matching and REVERSE_REGION_LOOKUP
     if len(text.strip()) < 2:
         return False
     cleaned = re.sub(r"[ㅋㅎㅠㅜ]+", "", text.lower())
     for word in NON_POLICY_KEYWORDS:
         if word in cleaned:
             return False
-    if re.match(r"^[가-힣]{1,3}$", text.strip()):
+    if re.match(r"^[가-힣]{1,3}(야|이야)?$", text.strip()):
+        # Clean conversational endings like '야', '이야'
+        clean_key = clean_text_for_matching(text)
+        # If cleaned key matches a region in lookup, treat as policy-related (region input)
+        if clean_key in REVERSE_REGION_LOOKUP:
+            return True
         return False
     return True
 # ─────────────────────────────────── #
@@ -250,7 +261,10 @@ REGION_MAPPING = {
         "경상남도 함양군", "경상남도 거창군", "경상남도 합천군"
     ],
     "제주": [
-        "제주특별자치도 제주시", "제주특별자치도 서귀포시", "제주도"
+        "제주특별자치도 제주시", "제주특별자치도 서귀포시", "제주도",
+        "제주",
+        "제주도",
+        "제주특별자치도"
     ]
 }
 
@@ -265,6 +279,10 @@ for std_region, full_names in REGION_MAPPING.items():
         # 전체 명칭도 직접 매핑
         if name not in REVERSE_REGION_LOOKUP:
             REVERSE_REGION_LOOKUP[name] = std_region
+
+# 추가: 단일 지명 토큰 매핑
+REVERSE_REGION_LOOKUP.setdefault("제주", "제주")
+REVERSE_REGION_LOOKUP.setdefault("제주도", "제주")
 
 # ─────────────────────────────────── #
 # 2. 정책 키워드 · 카테고리
@@ -367,6 +385,12 @@ def load_or_build_vectorstore(json_path: str,
 # ─────────────────────────────────── #
 from typing import Tuple, Optional, List
 
+# 사용자 입력 클린업 함수 추가
+import re
+def clean_user_input(text: str) -> str:
+    # Remove common conversational endings and particles that interfere with matching
+    return re.sub(r"(에\s*사는?|야|인데|이야|임|입니다|거든|임다|라구|라고)", "", text)
+
 # 조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
 def normalize_korean_tokens(text: str) -> List[str]:
     """
@@ -380,7 +404,19 @@ def normalize_korean_tokens(text: str) -> List[str]:
         normalized.append(core)
     return normalized
 
+# 지역 추출 보조 함수
+def extract_region(user_input: str, REGION_MAPPING: dict) -> str:
+    cleaned_input = clean_text_for_matching(user_input)
+    for std_region, keywords in REGION_MAPPING.items():
+        for keyword in keywords:
+            if keyword in cleaned_input:
+                return std_region
+    return ""
+
 def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[List[str]]]:
+    # 텍스트 정규화: 앞부분에서 strip 및 특수문자 제거
+    text = text.strip()
+    text = re.sub(r'[^\w\s]', '', text)  # Remove punctuation
     # 텍스트 전처리: 조사 제거 및 공백 정리
     text = re.sub(r"[^\w가-힣]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
@@ -389,23 +425,17 @@ def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[
     if m := re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text):
         age = int(m.group(1))
 
-    region = None
-
-    # REGION_KEYWORDS 기준 우선 매핑
-    for std_r, keywords in REGION_KEYWORDS.items():
-        if any(k in text for k in keywords):
-            region = std_r
+    # 지역 추출 부분 교체: REGION_MAPPING의 모든 시/군/구 이름이 포함되도록 확장되어 있어야 함
+    region = ""
+    for std_region, keywords in REGION_MAPPING.items():
+        if any(keyword in text for keyword in keywords):
+            region = std_region
             break
-
-    # REGION_KEYWORDS 매핑이 없을 경우 REVERSE_REGION_LOOKUP 사용
-    if region is None:
+    # Fallback: 단일 토큰 기반 지역 추출
+    if not region:
         for token in normalize_korean_tokens(text):
-            candidates = [token, token + "시", token + "군", token + "구"]
-            for cand in candidates:
-                if cand in REVERSE_REGION_LOOKUP:
-                    region = REVERSE_REGION_LOOKUP[cand]
-                    break
-            if region:
+            if token in REVERSE_REGION_LOOKUP:
+                region = REVERSE_REGION_LOOKUP[token]
                 break
 
     interests = None
@@ -673,6 +703,11 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         if user_info['interests']:
             stored_interests = user_info['interests']
 
+        # 💡 정보가 모두 없으면 바로 안내하고 다음 입력 대기
+        if not any([stored_age, stored_region, stored_interests]):
+            print("Bot:\n나이, 지역, 관심사 정보를 알려주시면 맞춤형 정책을 안내해드릴게요 😊\n")
+            continue
+
         # 관심사 추론
         predicted_keywords = None
         embedding = None
@@ -706,6 +741,30 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             response = llm.invoke(prompt.format(input=user_input).to_messages())
             predicted_keywords = [i.strip() for i in response.content.split(",") if i.strip()]
 
+        # ─────────────────────────────────────── #
+        # 🔧 예측 키워드 → 표준 관심사 매핑 개선
+        # - 벡터DB에서 가져온 '제주시', '거주자' 같은 토큰 제거
+        # - INTEREST_MAPPING에 정의된 키워드만 표준화해 사용
+        # ─────────────────────────────────────── #
+        if predicted_keywords:
+            std_interests = []
+            for kw in predicted_keywords:
+                # 먼저, 지역 키워드는 제외
+                if is_region_keyword(kw):
+                    continue
+                # 표준 관심사명 그대로 들어온 경우
+                if kw in INTEREST_MAPPING:
+                    if kw not in std_interests:
+                        std_interests.append(kw)
+                    continue
+                # 키워드가 INTEREST_MAPPING 하위 키워드에 포함되는지 확인
+                for std_i, kws in INTEREST_MAPPING.items():
+                    if kw in kws and std_i not in std_interests:
+                        std_interests.append(std_i)
+                        break
+            # 매핑 결과가 없다면 예측 키워드 무시
+            predicted_keywords = std_interests if std_interests else None
+
         # 관심사 초기화 조건 체크 및 저장
         if predicted_keywords:
             if is_new_topic(predicted_keywords, stored_interests):
@@ -727,12 +786,10 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}" )
 
         # 누적 직후, 사용자 정보가 여전히 모두 비어있다면 추천 차단
+        # 수정: 새로 추출된 값이 있으면 추천 흐름 진입하도록 조건 강화
         age = user_info['age']
         region = user_info['region']
         interests = user_info['interests']
-        if not any([stored_age, stored_region, stored_interests]):
-            print("Bot:\n나이, 지역, 관심사 정보를 알려주시면 맞춤형 정책을 안내해드릴게요 😊\n")
-            continue
 
         # ──────────────────────────────────────────────
         # 벡터 DB 유사 검색 - fallback 기반 검색 로직으로 대체
@@ -744,15 +801,15 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             "categories": {"$in": stored_interests}
         } if stored_interests else None
         if vectordb is not None:
-            results = vectordb.similarity_search(user_input, k=3, filter=filters_keywords_only)
-            if results:
-                # Output using print_result for each doc
-                for idx, doc in enumerate(results, 1):
-                    print_result(idx, doc)
-            else:
-                results = vectordb.similarity_search(user_input, k=3)
-                for idx, doc in enumerate(results, 1):
-                    print_result(idx, doc)
+            docs = vectordb.similarity_search(user_input, k=3, filter=filters_keywords_only)
+            # 정책 수가 너무 적을 때 메시지 보완
+            if not docs:
+                print("\nBot:\n조건에 맞는 정책이 없습니다. 아래는 전국 공통 정책 중 일부입니다.\n")
+                docs = vectordb.similarity_search(user_input, k=3)
+            elif len(docs) < 3:
+                print("\nBot:\n조건에 맞는 정책이 많지 않아요. 아래 정책을 참고해 주세요!\n")
+            for idx, doc in enumerate(docs, 1):
+                print_result(idx, doc)
 
             # After displaying the retrieved documents, prompt for missing info or continue
             if stored_age is None or stored_region is None:
