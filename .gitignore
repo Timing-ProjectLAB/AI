@@ -2,3 +2,5 @@
 chroma_policies/
 kwdb/
 categorydb/
+.venv/
+__pycache__/
