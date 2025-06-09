@@ -22,20 +22,15 @@ from tqdm import tqdm
 def extract_user_info(user_input: str):
     info = {"age": None, "region": None, "interests": [], "status": None, "income": None}
 
-    # 나이 추출
-    age_match = re.search(r'(\d{2})\s*살', user_input)
-    if age_match:
-        info["age"] = int(age_match.group(1))
+    # ✅ 전처리: 마침표, 쉼표 등 제거 → '여주에 사는 25살이야'로 만들기
+    clean_text = re.sub(r"[^\w가-힣]", " ", user_input)
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
 
-    # 지역 추출
-    for region in ["서울", "부산", "대전", "광주", "강남구", "종로구"]:
-        if region in user_input:
-            info["region"] = region
-            break
-
-    # 관심사 사전 기반
-    interest_keywords = ["운동", "주거", "복지", "대출", "창업", "취업"]
-    info["interests"] = [kw for kw in interest_keywords if kw in user_input]
+    # 🔁 정확한 나이/지역/관심사 파싱은 parse_user_input() 재활용
+    parsed_age, parsed_region, parsed_interests = parse_user_input(clean_text)
+    info["age"] = parsed_age
+    info["region"] = parsed_region
+    info["interests"] = parsed_interests if parsed_interests else []
 
     # 상태 추출
     if "대학생" in user_input:
@@ -225,6 +220,18 @@ REGION_MAPPING = {
     ]
 }
 
+# 지역 이름 역매핑 (예: '여주시' → '경기')
+REVERSE_REGION_LOOKUP = {}
+for std_region, full_names in REGION_MAPPING.items():
+    for name in full_names:
+        tokens = re.findall(r"[가-힣]{2,}", name)
+        for token in tokens:
+            if token not in REVERSE_REGION_LOOKUP:
+                REVERSE_REGION_LOOKUP[token] = std_region
+        # 전체 명칭도 직접 매핑
+        if name not in REVERSE_REGION_LOOKUP:
+            REVERSE_REGION_LOOKUP[name] = std_region
+
 # ─────────────────────────────────── #
 # 2. 정책 키워드 · 카테고리
 # ─────────────────────────────────── #
@@ -326,16 +333,46 @@ def load_or_build_vectorstore(json_path: str,
 # ─────────────────────────────────── #
 from typing import Tuple, Optional, List
 
+# 조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
+def normalize_korean_tokens(text: str) -> List[str]:
+    """
+    조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
+    """
+    tokens = re.findall(r"[가-힣]{2,}", text)
+    normalized = []
+    for token in tokens:
+        # 조사 제거
+        core = re.sub(r"(에|에서|에게|로|으로|의|를|을|이|가|은|는|도|만|이나|까지|부터)$", "", token)
+        normalized.append(core)
+    return normalized
+
 def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[List[str]]]:
+    # 텍스트 전처리: 조사 제거 및 공백 정리
+    text = re.sub(r"[^\w가-힣]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
     age = None
     if m := re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text):
         age = int(m.group(1))
 
     region = None
+
+    # REGION_KEYWORDS 기준 우선 매핑
     for std_r, keywords in REGION_KEYWORDS.items():
         if any(k in text for k in keywords):
             region = std_r
             break
+
+    # REGION_KEYWORDS 매핑이 없을 경우 REVERSE_REGION_LOOKUP 사용
+    if region is None:
+        for token in normalize_korean_tokens(text):
+            candidates = [token, token + "시", token + "군", token + "구"]
+            for cand in candidates:
+                if cand in REVERSE_REGION_LOOKUP:
+                    region = REVERSE_REGION_LOOKUP[cand]
+                    break
+            if region:
+                break
 
     interests = None
     matches = [std_i for std_i, kws in INTEREST_MAPPING.items() if any(k in text for k in kws)]
@@ -584,19 +621,13 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         user_info = extract_user_info(user_input)
         print(f"[🧠 자동 추출 정보] 나이: {user_info['age']}, 지역: {user_info['region']}, 관심사: {user_info['interests']}, 상태: {user_info['status']}, 소득: {user_info['income']}")
 
-        # 사용자 정보 누적 및 나이 추출(살 포함)
-        import re
-        age_match = re.search(r"(\d{2})\s*살", user_input)
-        if age_match:
-            stored_age = int(age_match.group(1))
-        # 기존 "세" 처리(복수 타입 지원)
-        if "세" in user_input:
-            match = re.search(r"(\d{2})세", user_input)
-            if match:
-                stored_age = int(match.group(1))
-
-        if any(loc in user_input for loc in ["서울", "부산", "대전", "대구", "광주", "인천"]):
-            stored_region = next(loc for loc in ["서울", "부산", "대전", "대구", "광주", "인천"] if loc in user_input)
+        # extract_user_info의 출력값을 그대로 반영
+        if user_info['age']:
+            stored_age = user_info['age']
+        if user_info['region']:
+            stored_region = user_info['region']
+        if user_info['interests']:
+            stored_interests = user_info['interests']
 
         # 관심사 추론
         predicted_keywords = None
@@ -672,6 +703,10 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 if stored_region is None:
                     missing.append("지역")
                 print(f"\n🤖 추가 정보를 알려주시면 더 정확한 정책을 추천해드릴 수 있어요! 👉 {', '.join(missing)} 정보를 입력해 주세요.")
+                # DEBUG: stored_region이 None일 때 입력 및 파싱 결과 출력
+                if stored_region is None:
+                    print(f"[DEBUG] user_input: {user_input}")
+                    print(f"[DEBUG] user_info['region']: {user_info['region']}")
             else:
                 print("\n🤖 다른 관심사가 있으시면 말씀해 주세요! 예: 주거정책, 대출, 창업지원 등")
         else:
