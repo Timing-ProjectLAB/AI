@@ -1,3 +1,12 @@
+# ─────────────────────────────────── #
+# 유효 질의 여부 판별 함수
+# ─────────────────────────────────── #
+def is_valid_query(text: str) -> bool:
+    tokens = re.findall(r"[가-힣a-zA-Z0-9]+", text)
+    return len(tokens) >= 3
+# 지역명 키워드 여부 판별 함수
+def is_region_keyword(word: str) -> bool:
+    return word in REVERSE_REGION_LOOKUP or any(word in names for names in REGION_MAPPING.values())
 #!/usr/bin/env python3
 # chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
 # 실행: python3 chatbot.py
@@ -620,6 +629,11 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
 
+        if not stored_age and not stored_region and not stored_interests:
+            if not is_valid_query(user_input):
+                print("Bot:\n안녕하세요! 궁금하신 정책이나 조건을 입력해 주세요 🙂\n")
+                continue
+
         # 사용자 입력에서 자동 정보 추출 및 출력
         user_info = extract_user_info(user_input)
         print(f"[🧠 자동 추출 정보] 나이: {user_info['age']}, 지역: {user_info['region']}, 관심사: {user_info['interests']}, 상태: {user_info['status']}, 소득: {user_info['income']}")
@@ -669,11 +683,18 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         if predicted_keywords:
             if is_new_topic(predicted_keywords, stored_interests):
                 print("🧹 기존 관심사를 초기화합니다.")
-                stored_interests = predicted_keywords
+                new_interests = predicted_keywords
             else:
+                new_interests = stored_interests[:]
                 for kw in predicted_keywords:
-                    if kw not in stored_interests:
-                        stored_interests.append(kw)
+                    if kw not in new_interests:
+                        new_interests.append(kw)
+
+            # 지역명을 관심사에서 제거
+            filtered_interests = [kw for kw in new_interests if not is_region_keyword(kw)]
+            if filtered_interests:
+                stored_interests = filtered_interests
+            # stored_interests = new_interests  # 기존 직접 대입은 제거/주석 처리
 
         print(f"[🔍 추론된 관심사] → {predicted_keywords}")
         print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}" )
