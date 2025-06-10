@@ -31,12 +31,58 @@ def is_policy_related_question(text: str) -> bool:
             return True
         return False
     return True
+
+# ─────────────────────────────────── #
+# LLM 기반 정책 질문 여부 판별 함수
+# ─────────────────────────────────── #
+def is_policy_related_question_llm(text: str) -> bool:
+    """
+    GPT-4o-mini를 사용해 입력이 정책 질문인지 Y/N 판별.
+    예외 발생 시 기존 rule-based 함수로 폴백.
+    """
+    prompt = (
+        "다음 사용자의 입력이 대한민국 청년 정책과 관련된 ‘질문’인지 "
+        "'Y' 또는 'N'으로만 대답하세요.\n\n"
+        f"사용자 입력: \"{text}\""
+    )
+    try:
+        resp = openai.ChatCompletion.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "너는 입력이 정책 질문인지 분류해 Y/N로만 대답하는 분류기야."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=1,
+        )
+        return resp.choices[0].message.content.strip().upper().startswith("Y")
+    except Exception:
+        return is_policy_related_question(text)
 # ─────────────────────────────────── #
 # 유효 질의 여부 판별 함수
 # ─────────────────────────────────── #
 def is_valid_query(text: str) -> bool:
+    # 숫자만 입력되어도 나이로 간주
+    if re.search(r"\b\d{1,2}\b", text):
+        return True
+
     tokens = re.findall(r"[가-힣a-zA-Z0-9]+", text)
-    return len(tokens) >= 3
+
+    # 1) 3단어 이상이면 무조건 정책 관련 질의로 간주
+    if len(tokens) >= 3:
+        return True
+
+    # 2) 2단어짜리 짧은 질문이라도 핵심 키워드가 포함되면 허용
+    if len(tokens) == 2:
+        for tok in tokens:
+            if (
+                tok == "정책" or
+                tok in KEYWORDS or
+                tok in INTEREST_MAPPING or
+                any(tok in kws for kws in INTEREST_MAPPING.values())
+            ):
+                return True
+    return False
 # 지역명 키워드 여부 판별 함수
 def is_region_keyword(word: str) -> bool:
     return word in REVERSE_REGION_LOOKUP or any(word in names for names in REGION_MAPPING.values())
@@ -90,9 +136,15 @@ def extract_user_info(user_input: str):
 
 
 def print_result(idx, doc):
+    """검색 결과를 JSON 형태로 출력. `answer` 필드에는 정책명을 넣는다."""
     result = {
         "policy_id": doc.metadata.get("policy_id", f"unknown_{idx}"),
-        "answer": doc.page_content.strip()[:100] + "..."  # 간단 요약
+        "answer": doc.metadata.get("title", "알 수 없는 정책명"),
+        # 디버깅용 점수
+        "score":     doc.metadata.get("debug_total_score"),
+        "region":    doc.metadata.get("debug_region_score"),
+        "interest":  doc.metadata.get("debug_interest_score"),
+        "keyword":   doc.metadata.get("debug_keyword_score")
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -102,6 +154,8 @@ def print_result(idx, doc):
 from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY", "")
+import openai
+openai.api_key = api_key
 embedding = OpenAIEmbeddings()
 # Load keyword vectorstore (ensure it's built with keyword terms only)
 keyword_vectordb = Chroma(persist_directory="./kwdb", embedding_function=embedding)
@@ -341,9 +395,13 @@ def extract_keywords(text: str) -> List[str]:
     return hits + sorted_extra
 
 def extract_categories(cat_field: str) -> List[str]:
+    """
+    정책 JSON의 category 필드(쉼표 구분 텍스트)를 그대로 리스트로 반환.
+    사전에 정의된 CATEGORIES에 없더라도 저장해 두고, 필터 단계에서 매칭합니다.
+    """
     if not cat_field:
         return []
-    return [c.strip() for c in cat_field.split(",") if c.strip() in CATEGORIES]
+    return [c.strip() for c in cat_field.split(",") if c.strip()]
 
 # ─────────────────────────────────── #
 # 3. 벡터스토어 로드/생성 (강화 버전)
@@ -390,8 +448,8 @@ def load_or_build_vectorstore(json_path: str,
             "policy_id":        p.get("policy_id"),
             "title":            p["title"],
             "region":           ", ".join(p.get("region_name", [])),
-            "categories":       ", ".join(extract_categories(p.get("category", ""))),  # ✅ 수정
-            "keywords":         ", ".join(merged_keywords),  # ✅ 수정
+            "categories":       extract_categories(p.get("category", "")),
+            "keywords":         merged_keywords,
             "min_age":          safe_int(p.get("min_age")),
             "max_age":          safe_int(p.get("max_age"), 99),
             "income_condition": p.get("income_condition", "제한 없음"),
@@ -449,8 +507,16 @@ def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[
     text = re.sub(r"\s+", " ", text).strip()
 
     age = None
-    if m := re.search(r"(?:만\s*)?(\d{2})\s*(?:세|살)", text):
+    # ① '26살', '26 세' 형태
+    if m := re.search(r"(?:만\s*)?(\d{1,2})\s*(?:세|살)", text):
         age = int(m.group(1))
+    # ② 단일 숫자만 있는 경우도 나이로 간주 (15~39세 범위)
+    if age is None:
+        m2 = re.search(r"\b(\d{1,2})\b", text)
+        if m2:
+            age_cand = int(m2.group(1))
+            if 15 <= age_cand <= 39:
+                age = age_cand
 
     # 지역 추출 부분 교체: REGION_MAPPING의 모든 시/군/구 이름이 포함되도록 확장되어 있어야 함
     region = ""
@@ -558,13 +624,12 @@ def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalC
 # 7. 가중치 필터 & 폴백
 # ─────────────────────────────────── #
 # 선형 가중합 모델 기반 필터링
-# 가중치: 지역 0.5, 관심사 0.3, 키워드 0.2
-# 모든 부분 점수는 0~1 사이로 정규화
-MIN_SCORE = 0.4  # 임계값(총합 1.0 중 0.4 이상이면 채택)
+# 가중치: 지역 0.6(전국 포함), 관심사 0.35, 키워드 0.05
+MIN_SCORE = 0.4  # 총합 1.0 중 0.4 이상이면 채택
 
-W_REGION   = 0.5
-W_INTEREST = 0.3
-W_KEYWORD  = 0.2
+W_REGION   = 0.6
+W_INTEREST = 0.35
+W_KEYWORD  = 0.05
 
 
 def jaccard_similarity(a: set, b: set) -> float:
@@ -599,9 +664,12 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
         # 1. 지역 점수 (R: 0 | 0.5 | 1)
         # ─────────────────────── #
         doc_region_str = d.metadata.get("region", "")
-        if region and any(k in doc_region_str for k in REGION_MAPPING[region]):
+        is_nationwide = ("전국" in doc_region_str) or (doc_region_str.strip() == "")
+        if is_nationwide:
+            region_score = 1.0  # 전국 정책은 동일 가중치
+        elif region and any(k in doc_region_str for k in REGION_MAPPING.get(region, [])):
             region_score = 1.0
-        elif region and region in doc_region_str:          # 인접·광역 등 부분 일치
+        elif region and region in doc_region_str:          # 느슨한 포함
             region_score = 0.5
         else:
             region_score = 0.0
@@ -609,14 +677,25 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
         # ─────────────────────── #
         # 2. 관심사 점수 (I: 0~1)
         # ─────────────────────── #
-        policy_tags = set(d.metadata.get("categories", []))
+        # 'categories'가 str(list) 형태로 들어올 수도 있어 파싱 진행
+        cat_raw = d.metadata.get("categories", [])
+        if isinstance(cat_raw, str):
+            cat_tokens = [c.strip() for c in re.split(r"[,\[\]'\"\s]+", cat_raw) if c.strip()]
+        else:
+            cat_tokens = cat_raw
+        policy_tags = set(cat_tokens)
         interest_score = jaccard_similarity(interests_set, policy_tags)
 
         # ─────────────────────── #
         # 3. 키워드 점수 (K: 0~1)
         # ─────────────────────── #
         if kw_hits:
-            doc_keywords = set(d.metadata.get("keywords", []))
+            key_raw = d.metadata.get("keywords", [])
+            if isinstance(key_raw, str):
+                key_tokens = [k.strip() for k in re.split(r"[,\[\]'\"\s]+", key_raw) if k.strip()]
+            else:
+                key_tokens = key_raw
+            doc_keywords = set(key_tokens)
             keyword_score = len(doc_keywords & set(kw_hits)) / len(kw_hits)
         else:
             keyword_score = 0.0
@@ -629,6 +708,11 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
             W_INTEREST * interest_score +
             W_KEYWORD  * keyword_score
         )
+                # 디버깅용 점수 메타데이터 저장
+        d.metadata["debug_region_score"]   = round(region_score,   3)
+        d.metadata["debug_interest_score"] = round(interest_score, 3)
+        d.metadata["debug_keyword_score"]  = round(keyword_score,  3)
+        d.metadata["debug_total_score"]    = round(score,         3)
 
         if score >= MIN_SCORE:
             filtered.append((score, d))
@@ -708,7 +792,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
 
-        if not is_policy_related_question(user_input):
+        if not is_policy_related_question_llm(user_input):
             print("Bot:\n저는 대한민국 청년 정책 안내를 도와드리는 챗봇이에요! 정책 관련 질문을 해주세요 😊\n")
             continue
 
@@ -818,42 +902,94 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         region = user_info['region']
         interests = user_info['interests']
 
-        # ──────────────────────────────────────────────
-        # 벡터 DB 유사 검색 - fallback 기반 검색 로직으로 대체
-        # ──────────────────────────────────────────────
-        # 기존 retriever.invoke(user_input) 등은 사용하지 않음.
-        # vectordb는 chroma_policies 인스턴스여야 함.
-        # Fallback 검색 - 유사한 정책이라도 추천
+        # ------ ① 벡터 검색 & 선별 ------
         filters_keywords_only = {
             "categories": {"$in": stored_interests}
         } if stored_interests else None
-        if vectordb is not None:
-            docs = vectordb.similarity_search(user_input, k=3, filter=filters_keywords_only)
-            # 정책 수가 너무 적을 때 메시지 보완
-            if not docs:
-                print("\nBot:\n조건에 맞는 정책이 없습니다. 아래는 전국 공통 정책 중 일부입니다.\n")
-                docs = vectordb.similarity_search(user_input, k=3)
-            elif len(docs) < 3:
-                print("\nBot:\n조건에 맞는 정책이 많지 않아요. 아래 정책을 참고해 주세요!\n")
-            for idx, doc in enumerate(docs, 1):
-                print_result(idx, doc)
 
-            # After displaying the retrieved documents, prompt for missing info or continue
-            if stored_age is None or stored_region is None:
-                missing = []
-                if stored_age is None:
-                    missing.append("나이")
-                if stored_region is None:
-                    missing.append("지역")
-                print(f"\n🤖 추가 정보를 알려주시면 더 정확한 정책을 추천해드릴 수 있어요! 👉 {', '.join(missing)} 정보를 입력해 주세요.")
-                # DEBUG: stored_region이 None일 때 입력 및 파싱 결과 출력
-                if stored_region is None:
-                    print(f"[DEBUG] user_input: {user_input}")
-                    print(f"[DEBUG] user_info['region']: {user_info['region']}")
-            else:
-                print("\n🤖 다른 관심사가 있으시면 말씀해 주세요! 예: 주거정책, 대출, 창업지원 등")
-        else:
-            print("❌ vectordb가 초기화되지 않았습니다. 정책 검색을 수행할 수 없습니다.")
+        docs = []
+        if vectordb is not None:
+            try:
+                # 넉넉히 50개 검색 후 정교 필터링
+                raw_docs = vectordb.similarity_search(user_input, k=50, filter=filters_keywords_only)
+            except Exception:
+                raw_docs = vectordb.similarity_search(user_input, k=50)
+
+            # ✅ 지역·나이·관심사 기반 스코어링
+            user_age_for_score = stored_age if stored_age else 0
+            user_region_for_score = stored_region if stored_region else ""
+            docs = filter_docs(
+                raw_docs,
+                user_age_for_score,
+                user_input,
+                user_region_for_score,
+                stored_interests
+            )
+
+            docs = docs[:3]  # 상위 3건만
+
+        # ------ ② 출력 로직 ------
+        if not docs:
+            print("\nBot:\n현재 조건에 딱 맞는 정책이 보이지 않아요.")
+
+            # 1) 주요/추론 관심사 파악
+            main_interest = stored_interests[0] if stored_interests else None
+            if not main_interest:
+                # 사용자 입력에서 INTEREST_MAPPING 키워드 스캔
+                for std_i, kws in INTEREST_MAPPING.items():
+                    if any(k in user_input for k in kws):
+                        main_interest = std_i
+                        break
+
+            # 2) 세부 관심사 질문 (SUB_INTEREST_MAPPING 이용)
+            clarified = False
+            if main_interest:
+                sub_map = SUB_INTEREST_MAPPING.get(main_interest)
+                if sub_map:
+                    sub_options = ", ".join(sub_map.keys())
+                    ask = f"{main_interest}과 관련해 어떤 지원을 찾고 계신가요? (예: {sub_options}) : "
+                    sub_choice = input(ask).strip()
+                    if sub_choice:
+                        if sub_choice not in stored_interests:
+                            stored_interests.append(sub_choice)
+                        refined_query = f"{user_input} {sub_choice}"
+                        raw_docs = vectordb.similarity_search(refined_query, k=50)
+                        docs = filter_docs(
+                            raw_docs,
+                            stored_age if stored_age else 0,
+                            refined_query,
+                            stored_region if stored_region else "",
+                            stored_interests
+                        )
+                        docs = docs[:3]
+                        clarified = True
+
+            # 3) 일반 관심사 질문 (세부 관심사 실패 또는 매핑 없음)
+            if not clarified:
+                generic_choice = input(
+                    "어떤 분야의 정책을 찾고 계신가요? (예: 주거, 창업, 취업, 교육, 복지, 금융 등): "
+                ).strip()
+                if generic_choice:
+                    if generic_choice not in stored_interests:
+                        stored_interests.append(generic_choice)
+                    refined_query = f"{user_input} {generic_choice}"
+                    raw_docs = vectordb.similarity_search(refined_query, k=50)
+                    docs = filter_docs(
+                        raw_docs,
+                        stored_age if stored_age else 0,
+                        refined_query,
+                        stored_region if stored_region else "",
+                        stored_interests
+                    )
+                    docs = docs[:3]
+
+            # 4) 최종 폴백: 전국 공통 정책
+            if not docs:
+                print("조건에 맞는 정책이 없어 전국 공통 정책 3건을 대신 보여드릴게요.\n")
+                docs = vectordb.similarity_search("청년 정책 전국 공통", k=3)
+
+        for idx, doc in enumerate(docs, 1):
+            print_result(idx, doc)
 
 # ─────────────────────────────────── #
 # Helper: Fallback-based document retrieval
