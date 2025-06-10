@@ -1,11 +1,29 @@
 # 추가: 코드 맨 위에 clean_text_for_matching 함수 정의
-import re
+#!/usr/bin/env python3
+# chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
+# 실행: python3 chatbot.py
+# 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
+import os, re, json
+from typing import List, Tuple, Optional
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
+from langchain_community.vectorstores import Chroma
+from langchain.schema import Document
+from langchain.prompts import (
+    ChatPromptTemplate, 
+    SystemMessagePromptTemplate, 
+    HumanMessagePromptTemplate
+)
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from tqdm import tqdm
+from functools import lru_cache
+
+# 특수문자 제거, 소문자화 등을 통해 키워드 매칭에 방해가 되는 요소들을 제거하는 함수
 def clean_text_for_matching(text):
     return re.sub(r"[^\w\s]", "", text).replace("에", "").replace("에서", "").replace("인데", "").replace("야", "").strip()
-# ─────────────────────────────────── #
-# 🔧 "다른 정책"과 같은 일반 추가 요청 판별
-# ─────────────────────────────────── #
+# 사용자가 “다른 정책”, “추가로 보여줘” 같은 추가 추천 요청인지 판별하는 함수
 def is_generic_more_request(text: str) -> bool:
     """
     사용자가 '다른 정책', '추가 정책', '더 보여줘' 등
@@ -31,7 +49,7 @@ NON_POLICY_KEYWORDS = [
     "기분 어때", "사랑해", "귀여워", "좋아해", "여자친구", "남자친구", "썸", "연애", "이상형",
     "퀴즈", "수수께끼", "농담", "웃겨줘", "재밌는 얘기", "우주", "과학", "역사", "유튜브", "게임", "유머"
 ]
-
+# 간단한 휴리스틱과 키워드 리스트(NON_POLICY_KEYWORDS)를 기반으로, 입력이 정책 관련 질의인지 1차 검사하는 함수
 def is_policy_related_question(text: str) -> bool:
     import re
     # uses global clean_text_for_matching and REVERSE_REGION_LOOKUP
@@ -53,9 +71,7 @@ def is_policy_related_question(text: str) -> bool:
 # ─────────────────────────────────── #
 # LLM 기반 정책 질문 여부 판별 함수
 # ─────────────────────────────────── #
-# 추가 import
-from functools import lru_cache
-
+# 위 휴리스틱이 모호할 때, GPT-4o-mini에 “Y/N” 분류를 요청해 보다 정확히 판단하고, 실패 시 rule-based로 폴백
 @lru_cache(maxsize=1024)           # 같은 문장은 한 번만 문의
 def is_policy_related_question_llm(text: str) -> bool:
     """
@@ -108,9 +124,8 @@ def is_policy_related_question_llm(text: str) -> bool:
     except Exception:
         # 네트워크/쿼터 문제 시 휴리스틱으로 폴백
         return is_policy_related_question(cleaned)
-# ─────────────────────────────────── #
-# 유효 질의 여부 판별 함수
-# ─────────────────────────────────── #
+
+# 토큰 수나 핵심 키워드 포함 여부를 보고 “유효한 정책 질의”인지 추가 검사하는 함수
 def is_valid_query(text: str) -> bool:
     # 숫자만 입력되어도 나이로 간주
     if re.search(r"\b\d{1,2}\b", text):
@@ -136,26 +151,7 @@ def is_valid_query(text: str) -> bool:
 # 지역명 키워드 여부 판별 함수
 def is_region_keyword(word: str) -> bool:
     return word in REVERSE_REGION_LOOKUP or any(word in names for names in REGION_MAPPING.values())
-#!/usr/bin/env python3
-# chatbot.py  ·  Adaptive Filtering + Keyword·Category Edition
-# 실행: python3 chatbot.py
-# 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
-import os, re, json
-
-from typing import List, Tuple, Optional
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.vectorstores import Chroma
-from langchain.schema import Document
-from langchain.prompts import (
-    ChatPromptTemplate, 
-    SystemMessagePromptTemplate, 
-    HumanMessagePromptTemplate
-)
-from langchain.chains import ConversationalRetrievalChain
-from langchain.memory import ConversationBufferMemory
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from tqdm import tqdm
 # 사용자 입력에서 정보 자동 추출 함수
 def extract_user_info(user_input: str):
     info = {"age": None, "region": None, "interests": [], "status": None, "income": None}
