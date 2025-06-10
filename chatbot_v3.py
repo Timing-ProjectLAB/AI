@@ -4,6 +4,24 @@ import re
 def clean_text_for_matching(text):
     return re.sub(r"[^\w\s]", "", text).replace("에", "").replace("에서", "").replace("인데", "").replace("야", "").strip()
 # ─────────────────────────────────── #
+# 🔧 "다른 정책"과 같은 일반 추가 요청 판별
+# ─────────────────────────────────── #
+def is_generic_more_request(text: str) -> bool:
+    """
+    사용자가 '다른 정책', '추가 정책', '더 보여줘' 등
+    구체적 조건 없는 추가 추천을 요구하는지 판별.
+    """
+    text = text.strip()
+    if re.search(r"다른\s*정책", text):
+        return True
+    if "정책" in text and re.search(r"(더|추가|또|없어|있어)", text):
+        return True
+    # "더 알려줘", "더 보여줘", "더 추천해줘" 처리
+    if re.search(r"더\s*(알려줘|보여줘|추천해줘)", text):
+        return True
+    return False
+
+# ─────────────────────────────────── #
 # 정책 관련 질문 여부 판별 함수
 # ─────────────────────────────────── #
 NON_POLICY_KEYWORDS = [
@@ -35,29 +53,61 @@ def is_policy_related_question(text: str) -> bool:
 # ─────────────────────────────────── #
 # LLM 기반 정책 질문 여부 판별 함수
 # ─────────────────────────────────── #
+# 추가 import
+from functools import lru_cache
+
+@lru_cache(maxsize=1024)           # 같은 문장은 한 번만 문의
 def is_policy_related_question_llm(text: str) -> bool:
     """
-    GPT-4o-mini를 사용해 입력이 정책 질문인지 Y/N 판별.
-    예외 발생 시 기존 rule-based 함수로 폴백.
+    GPT-4o-mini로 ‘정책 관련 질문인지’ Y/N 분류.
+    - refined heuristic for short/numeric/keyword input
+    - LLM 오류 시 rule-based 폴백.
     """
-    prompt = (
-        "다음 사용자의 입력이 대한민국 청년 정책과 관련된 ‘질문’인지 "
-        "'Y' 또는 'N'으로만 대답하세요.\n\n"
-        f"사용자 입력: \"{text}\""
+    cleaned = text.strip()
+    if not cleaned:
+        return False  # 빈 입력
+
+    # '다른 정책', '추가 정책' 등 일반 추가 추천 요청은 정책 관련으로 간주
+    if is_generic_more_request(cleaned):
+        return True
+
+    # ① 숫자 1~2자리만 입력 → 나이로 간주 → 정책 질문 True
+    if re.fullmatch(r"\d{1,2}", cleaned):
+        return True
+
+    # ② 단어 1~2자여도 관심사·지역 키워드라면 True
+    if cleaned in REVERSE_REGION_LOOKUP:
+        return True
+    if cleaned in INTEREST_MAPPING:
+        return True
+    if any(cleaned in kws for kws in INTEREST_MAPPING.values()):
+        return True
+
+    # ③ 1글자·특수문자·웃음(ㅋㅎ)만 → False
+    if len(cleaned) == 1 or re.fullmatch(r"[ㅋㅎ]+", cleaned):
+        return False
+
+    system_msg = (
+        "너는 대한민국 청년 정책 상담 챗봇의 분류기야. "
+        "아래 사용자 입력이 정책과 *관련된 질문*인지 판단해. "
+        "대답은 'Y' 또는 'N' 중 하나로만."
     )
+    user_msg = f"사용자 입력: {cleaned}\n\n정책 관련 질문인가?"
+
     try:
         resp = openai.ChatCompletion.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "너는 입력이 정책 질문인지 분류해 Y/N로만 대답하는 분류기야."},
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
             ],
             temperature=0,
             max_tokens=1,
         )
         return resp.choices[0].message.content.strip().upper().startswith("Y")
     except Exception:
-        return is_policy_related_question(text)
+        # 네트워크/쿼터 문제 시 휴리스틱으로 폴백
+        return is_policy_related_question(cleaned)
 # ─────────────────────────────────── #
 # 유효 질의 여부 판별 함수
 # ─────────────────────────────────── #
@@ -136,11 +186,13 @@ def extract_user_info(user_input: str):
 
 
 def print_result(idx, doc):
-    """검색 결과를 JSON 형태로 출력. `answer` 필드에는 정책명을 넣는다."""
     result = {
         "policy_id": doc.metadata.get("policy_id", f"unknown_{idx}"),
-        "answer": doc.metadata.get("title", "알 수 없는 정책명"),
-        # 디버깅용 점수
+        "name":      doc.metadata.get("title"),
+        "summary":   doc.metadata.get("summary"),
+        "eligibility": f"{doc.metadata.get('min_age','?')}~{doc.metadata.get('max_age','?')}세 / {doc.metadata.get('region','전국')}",
+        "period":    doc.metadata.get("apply_period",""),
+        # ↓ 디버깅
         # "score":     doc.metadata.get("debug_total_score"),
         # "region":    doc.metadata.get("debug_region_score"),
         # "interest":  doc.metadata.get("debug_interest_score"),
@@ -453,6 +505,7 @@ def load_or_build_vectorstore(json_path: str,
             "min_age":          safe_int(p.get("min_age")),
             "max_age":          safe_int(p.get("max_age"), 99),
             "income_condition": p.get("income_condition", "제한 없음"),
+            "summary": (p.get("support_content") or p.get("description", ""))[:200],
             "apply_period":     p.get("apply_period", ""),}   
 
         chunks = splitter.split_text(text)
@@ -550,6 +603,22 @@ def missing_info(age, region, interests) -> List[str]:
         needs.append("관심사")
     return needs
 
+# ─────────────────────────────────── #
+# 🔧 추천 가능한 관심사 리스트 헬퍼
+# ─────────────────────────────────── #
+def suggest_remaining_interests(current: List[str]) -> str:
+    """
+    현재 stored_interests 를 기준으로 아직 제안하지 않은
+    INTEREST_MAPPING 상위 카테고리를 콤마로 나열해 반환.
+    5개까지만 보여주고 나머지는 '등'으로 표기.
+    """
+    remaining = [k for k in INTEREST_MAPPING.keys() if k not in current]
+    shown = remaining[:5]
+    suggestion = ", ".join(shown)
+    if len(remaining) > 5:
+        suggestion += " 등"
+    return suggestion
+
 
 def classify_user_type(text: str) -> str:
     known = ["청년내일채움공제", "도약계좌", "구직활동지원금", "국민취업지원제도", "정책명"]
@@ -625,7 +694,7 @@ def create_rag_chain(vectordb: Chroma, api_key: str) -> ConversationalRetrievalC
 # ─────────────────────────────────── #
 # 선형 가중합 모델 기반 필터링
 # 가중치: 지역 0.6(전국 포함), 관심사 0.35, 키워드 0.05
-MIN_SCORE = 0.4  # 총합 1.0 중 0.4 이상이면 채택
+MIN_SCORE = 0.3  # 총합 1.0 중 0.3 이상이면 채택
 
 W_REGION   = 0.6
 W_INTEREST = 0.35
@@ -684,7 +753,13 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
         else:
             cat_tokens = cat_raw
         policy_tags = set(cat_tokens)
-        interest_score = jaccard_similarity(interests_set, policy_tags)
+
+        if policy_tags:
+            interest_score = jaccard_similarity(interests_set, policy_tags)
+        else:
+            # 카테고리가 비어 있으면 문서 본문에 관심사 키워드가 직접 포함되어 있는지 계산
+            hits = sum(1 for i in interests_set if i in d.page_content)
+            interest_score = hits / len(interests_set) if interests_set else 0.0
 
         # ─────────────────────── #
         # 3. 키워드 점수 (K: 0~1)
@@ -701,14 +776,26 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
             keyword_score = 0.0
 
         # ─────────────────────── #
-        # 4. 최종 점수
+        # 4. 최종 점수 (동적 가중치)
         # ─────────────────────── #
-        score = (
-            W_REGION   * region_score +
-            W_INTEREST * interest_score +
-            W_KEYWORD  * keyword_score
-        )
-                # 디버깅용 점수 메타데이터 저장
+        total_w = 0
+        score_sum = 0
+        if region:
+            total_w += W_REGION
+            score_sum += W_REGION * region_score
+        if interests_set:
+            total_w += W_INTEREST
+            score_sum += W_INTEREST * interest_score
+        if kw_hits:
+            total_w += W_KEYWORD
+            score_sum += W_KEYWORD * keyword_score
+        # 모든 항목이 비어 있으면 키워드만이라도 사용
+        if total_w == 0:
+            total_w = W_KEYWORD
+            score_sum = W_KEYWORD * keyword_score
+        score = score_sum / total_w
+
+        # 디버깅용 점수 메타데이터 저장
         d.metadata["debug_region_score"]   = round(region_score,   3)
         d.metadata["debug_interest_score"] = round(interest_score, 3)
         d.metadata["debug_keyword_score"]  = round(keyword_score,  3)
@@ -779,6 +866,8 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
     stored_age = None
     stored_region = None
     stored_interests = []
+    # 이미 사용자에게 보여준 정책ID 집합
+    recommended_ids = set()
 
     # Ensure vectordb refers to main policy vectorstore
     vectordb = policy_vectordb if policy_vectordb is not None else policy_vectordb
@@ -792,13 +881,22 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
 
-        if not is_policy_related_question_llm(user_input):
+        # 사용자가 '다른 정책' 등 추가 추천만 요청했는지 플래그
+        force_more_request = is_generic_more_request(user_input)
+
+        # 사용자가 '어떤 분야'를 물으면 현재 가능한 카테고리 제안
+        if re.search(r"어떤\s*분야.*(있|야|가)", user_input):
+            suggestion = suggest_remaining_interests(stored_interests)
+            print(f"Bot:\n현재 선택할 수 있는 분야로는 {suggestion}이 있습니다.\n")
+            continue
+
+        if not force_more_request and not is_policy_related_question_llm(user_input):
             print("Bot:\n저는 대한민국 청년 정책 안내를 도와드리는 챗봇이에요! 정책 관련 질문을 해주세요 😊\n")
             continue
 
-        # 유효 질문인지 검사
+        # 유효 질문인지 검사 (단, '다른 정책' 추가 요청은 건너뜀)
         age, region, interests = parse_user_input(user_input)
-        if not is_valid_query(user_input) and not any([age, region, interests]):
+        if not force_more_request and not is_valid_query(user_input) and not any([age, region, interests]):
             print("Bot:\n안녕하세요! 궁금하신 정책이나 조건을 입력해 주세요 🙂\n")
             continue
 
@@ -910,10 +1008,21 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         docs = []
         if vectordb is not None:
             try:
-                # 넉넉히 50개 검색 후 정교 필터링
-                raw_docs = vectordb.similarity_search(user_input, k=50, filter=filters_keywords_only)
+                # 만약 '다른 정책' 같은 일반 요청이면 누적 정보를 사용해 질의 재구성
+                search_query = user_input
+                if force_more_request:
+                    search_query = build_query("추천", stored_age, stored_region, stored_interests)
+                    # 추가 요청 시 필터 없이 더 많은 후보 검색
+                    raw_docs = vectordb.similarity_search(search_query, k=50)
+                else:
+                    raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
             except Exception:
-                raw_docs = vectordb.similarity_search(user_input, k=50)
+                search_query = user_input
+                if force_more_request:
+                    search_query = build_query("추천", stored_age, stored_region, stored_interests)
+                    raw_docs = vectordb.similarity_search(search_query, k=50)
+                else:
+                    raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
 
             # ✅ 지역·나이·관심사 기반 스코어링
             user_age_for_score = stored_age if stored_age else 0
@@ -921,7 +1030,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             docs = filter_docs(
                 raw_docs,
                 user_age_for_score,
-                user_input,
+                search_query,
                 user_region_for_score,
                 stored_interests
             )
@@ -930,7 +1039,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
 
         # ------ ② 출력 로직 ------
         if not docs:
-            print("\nBot:\n현재 조건에 딱 맞는 정책이 보이지 않아요.")
+            #print("\nBot:\n현재 조건에 딱 맞는 정책이 보이지 않아요.")
 
             # 1) 주요/추론 관심사 파악
             main_interest = stored_interests[0] if stored_interests else None
@@ -966,9 +1075,9 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
 
             # 3) 일반 관심사 질문 (세부 관심사 실패 또는 매핑 없음)
             if not clarified:
-                generic_choice = input(
-                    "어떤 분야의 정책을 찾고 계신가요? (예: 주거, 창업, 취업, 교육, 복지, 금융 등): "
-                ).strip()
+                suggestion_list = suggest_remaining_interests(stored_interests)
+                prompt_text = f"어떤 분야의 정책을 찾고 계신가요? (예: {suggestion_list}): "
+                generic_choice = input(prompt_text).strip()
                 if generic_choice:
                     if generic_choice not in stored_interests:
                         stored_interests.append(generic_choice)
@@ -988,8 +1097,51 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 print("조건에 맞는 정책이 없어 전국 공통 정책 3건을 대신 보여드릴게요.\n")
                 docs = vectordb.similarity_search("청년 정책 전국 공통", k=3)
 
-        for idx, doc in enumerate(docs, 1):
-            print_result(idx, doc)
+        # 👉 이미 제시한 정책은 제외하고 최대 3건까지 출력, 중복 제거 강화
+        unique_docs = []
+        seen_ids = set()              # 중복 제거용(현재 회차)
+        for d in docs:
+            pid = d.metadata.get("policy_id")
+            if not pid:
+                continue
+            if pid in recommended_ids or pid in seen_ids:
+                continue              # 이미 보여줬거나 현재 리스트에 중복
+            unique_docs.append(d)
+            seen_ids.add(pid)
+            if len(unique_docs) == 3:
+                break
+
+        # 추가 탐색: 중복 제거로 3건이 안 채워졌을 경우 raw_docs에서 보충 (seen_ids도 체크)
+        if len(unique_docs) < 3:
+            # raw_docs가 있을 때만
+            extra_pool = [rd for rd in raw_docs
+                          if rd.metadata.get("policy_id")
+                          and rd.metadata.get("policy_id") not in recommended_ids
+                          and rd.metadata.get("policy_id") not in seen_ids]
+            for rd in extra_pool:
+                unique_docs.append(rd)
+                seen_ids.add(rd.metadata.get("policy_id"))
+                if len(unique_docs) == 3:
+                    break
+
+        if not unique_docs:
+            print("Bot:\n더 이상 새로운 정책을 찾지 못했어요. 다른 조건을 입력해 보실래요?\n")
+            continue
+
+        policy_ids = []
+        answers    = []
+        for doc in unique_docs:
+            pid = doc.metadata.get("policy_id", "")
+            pname = doc.metadata.get("title", "")
+            policy_ids.append(pid)
+            answers.append(f"{pname}에 지원할 수 있습니다.")
+            recommended_ids.add(pid)          # 기록
+
+        result_obj = {
+            "policy_id": policy_ids,
+            "answer": answers
+        }
+        print(json.dumps(result_obj, ensure_ascii=False, indent=2))
 
 # ─────────────────────────────────── #
 # Helper: Fallback-based document retrieval
