@@ -141,10 +141,10 @@ def print_result(idx, doc):
         "policy_id": doc.metadata.get("policy_id", f"unknown_{idx}"),
         "answer": doc.metadata.get("title", "알 수 없는 정책명"),
         # 디버깅용 점수
-        "score":     doc.metadata.get("debug_total_score"),
-        "region":    doc.metadata.get("debug_region_score"),
-        "interest":  doc.metadata.get("debug_interest_score"),
-        "keyword":   doc.metadata.get("debug_keyword_score")
+        # "score":     doc.metadata.get("debug_total_score"),
+        # "region":    doc.metadata.get("debug_region_score"),
+        # "interest":  doc.metadata.get("debug_interest_score"),
+        # "keyword":   doc.metadata.get("debug_keyword_score")
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
