@@ -5,3 +5,5 @@ langchain-chroma
 chromadb
 python-dotenv
 openai
+tqdm
+pydantic
