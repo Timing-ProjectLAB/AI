@@ -1279,6 +1279,8 @@ def generate_policy_response(
     # 2) 필수 정보 확인 -----------------------------------------------
     # 👉 누적 정보를 세션에 즉시 저장해 부분 입력도 기억
     session["user_info"] = user_info
+
+    # 누락 항목 식별
     missing = []
     if age is None:
         missing.append("age")
@@ -1288,8 +1290,11 @@ def generate_policy_response(
         missing.append("interests")
 
     if missing:
+        label_map = {"age": "나이", "region": "지역", "interests": "관심사"}
+        missing_kor = [label_map[m] for m in missing]
+        prompt_text = f"{', '.join(missing_kor)}를 알려주시면 맞춤형 정책을 추천해드릴게요."
         return {
-            "message": "나이, 지역, 관심사를 알려주시면 맞춤형 정책을 추천해드릴게요.",
+            "message": prompt_text,
             "missing_info": missing,
         }
 
