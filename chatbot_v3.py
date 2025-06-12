@@ -1277,6 +1277,8 @@ def generate_policy_response(
     interests = list(user_info.get("interests", []))  # copy
 
     # 2) 필수 정보 확인 -----------------------------------------------
+    # 👉 누적 정보를 세션에 즉시 저장해 부분 입력도 기억
+    session["user_info"] = user_info
     missing = []
     if age is None:
         missing.append("age")
