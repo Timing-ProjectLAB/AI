@@ -19,6 +19,7 @@ from langchain.memory import ConversationBufferMemory
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from tqdm import tqdm
 from functools import lru_cache
+import time
 
 # 특수문자 제거, 소문자화 등을 통해 키워드 매칭에 방해가 되는 요소들을 제거하는 함수
 def clean_text_for_matching(text):
@@ -868,6 +869,8 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
     # Ensure vectordb refers to main policy vectorstore
     vectordb = policy_vectordb if policy_vectordb is not None else policy_vectordb
 
+    # ⏱ total_response_time = 0 # 응답시간 계산 나중에 제거하기
+    # ⏱ response_count = 0 # 응답 횟수 나중에 제거
     def is_new_topic(predicted: list[str], stored: list[str]) -> bool:
         return not any(kw in stored for kw in predicted)
 
@@ -876,6 +879,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         if user_input.strip().lower() in ["종료", "exit", "quit"]:
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
+
 
         # 사용자가 '다른 정책' 등 추가 추천만 요청했는지 플래그
         force_more_request = is_generic_more_request(user_input)
@@ -912,6 +916,8 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         if not any([stored_age, stored_region, stored_interests]):
             print("Bot:\n나이, 지역, 관심사 정보를 알려주시면 맞춤형 정책을 안내해드릴게요 😊\n")
             continue
+
+        # ⏱ start_time = time.time()  # 응답 시간 측정 시작 (위치 이동) # 추후 제거
 
         # 관심사 추론
         predicted_keywords = None
@@ -1077,6 +1083,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 if generic_choice:
                     if generic_choice not in stored_interests:
                         stored_interests.append(generic_choice)
+                    start_time = time.time()  # ⏱ reset timer after user input
                     refined_query = f"{user_input} {generic_choice}"
                     raw_docs = vectordb.similarity_search(refined_query, k=50)
                     docs = filter_docs(
@@ -1119,6 +1126,14 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 seen_ids.add(rd.metadata.get("policy_id"))
                 if len(unique_docs) == 3:
                     break
+        # ------ ⏱ 응답 시간 측정 및 출력 ------
+        # ⏱ end_time = time.time()
+        # ⏱ elapsed = end_time - start_time
+        # ⏱ total_response_time += elapsed
+        # ⏱ response_count += 1
+
+        # ⏱ print(f"\n⏱ 응답 시간: {elapsed:.2f}초")
+        # ⏱ print(f"📊 평균 응답 시간: {total_response_time / response_count:.2f}초\n")
 
         if not unique_docs:
             print("Bot:\n더 이상 새로운 정책을 찾지 못했어요. 다른 조건을 입력해 보실래요?\n")
@@ -1180,3 +1195,150 @@ def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
             continue
 
     return []
+
+# ─────────────────────────────────── #
+# 🔗 FastAPI 연동용 단일 요청 처리 함수
+# ─────────────────────────────────── #
+from typing import Dict
+
+def _compose_reason(doc: Document, user_info: Dict) -> str:
+    """
+    간단한 추천 사유 문자열 생성
+    """
+    reasons = []
+    age = user_info.get("age")
+    region = user_info.get("region")
+    interests = user_info.get("interests", [])
+
+    # 나이
+    if age is not None:
+        min_age = doc.metadata.get("min_age", 0)
+        max_age = doc.metadata.get("max_age", 99)
+        if min_age <= age <= max_age:
+            reasons.append("나이 조건 부합")
+
+    # 지역
+    doc_region = doc.metadata.get("region", "")
+    if region:
+        if "전국" in doc_region or region in doc_region:
+            reasons.append("지역 조건 부합")
+
+    # 관심사
+    if interests:
+        doc_cats = doc.metadata.get("categories", [])
+        if isinstance(doc_cats, str):
+            doc_cats = [c.strip() for c in doc_cats.split(",") if c.strip()]
+        if set(interests) & set(doc_cats):
+            reasons.append("관심사 조건 부합")
+
+    return ", ".join(reasons) if reasons else "일부 조건 부합"
+
+def generate_policy_response(
+    user_id: str,
+    user_input: str,
+    *,
+    vectordb: Chroma = policy_vectordb,
+    keyword_vectordb: Chroma = keyword_vectordb,
+    category_vectordb: Chroma = category_vectordb,
+) -> dict:
+    """
+    FastAPI 서버에서 호출 가능한 단일 질의‑응답 함수.
+    - user_input: 사용자의 자연어 질문
+    - 반환 형식은 업무 요청서에 명시된 JSON 구조를 따른다.
+    """
+
+    # 1) 사용자 정보 추출 ---------------------------------------------
+    user_info                = extract_user_info(user_input)
+    age, region, interests   = user_info["age"], user_info["region"], user_info["interests"]
+
+    # 2) 필수 정보 확인 -----------------------------------------------
+    missing = []
+    if age is None:
+        missing.append("age")
+    if region is None:
+        missing.append("region")
+    if not interests:
+        missing.append("interests")
+
+    if missing:
+        return {
+            "message": "나이, 지역, 관심사를 알려주시면 맞춤형 정책을 추천해드릴게요.",
+            "missing_info": missing,
+        }
+
+    # 3) (선택) 관심사 보강 -------------------------------------------
+    #    벡터 DB를 이용해 추가 관심사를 예측하고, 기존 관심사에 병합
+    predicted_interests = []
+    embedding = None
+
+    if keyword_vectordb:
+        embedding = OpenAIEmbeddings()
+        qvec = embedding.embed_query(user_input)
+        docs = keyword_vectordb.similarity_search_by_vector(qvec, k=3)
+        predicted_interests.extend([d.page_content for d in docs])
+
+    if not predicted_interests and category_vectordb:
+        if embedding is None:
+            embedding = OpenAIEmbeddings()
+        qvec = embedding.embed_query(user_input)
+        docs = category_vectordb.similarity_search_by_vector(qvec, k=2)
+        predicted_interests.extend([d.page_content for d in docs])
+
+    # INTEREST_MAPPING 기반 표준화
+    std_preds = []
+    for kw in predicted_interests:
+        if kw in INTEREST_MAPPING and kw not in std_preds:
+            std_preds.append(kw)
+            continue
+        for std_i, kws in INTEREST_MAPPING.items():
+            if kw in kws and std_i not in std_preds:
+                std_preds.append(std_i)
+                break
+
+    # 병합
+    for p in std_preds:
+        if p not in interests:
+            interests.append(p)
+
+    # 4) 벡터 검색 + 필터링 -------------------------------------------
+    search_query = build_query(user_input, age, region, interests)
+    try:
+        raw_docs = vectordb.similarity_search(search_query, k=50)
+    except Exception:
+        # 검색 오류 시 최소한의 질의로 재시도
+        raw_docs = vectordb.similarity_search(user_input, k=50)
+
+    docs = filter_docs(raw_docs, age, search_query, region, interests)[:3]
+
+    # 5) 결과가 없을 때 폴백 ------------------------------------------
+    if not docs:
+        fallback_docs = vectordb.similarity_search("청년 정책 전국 공통", k=3)
+        policies = []
+        for d in fallback_docs:
+            policies.append({
+                "policy_id": d.metadata.get("policy_id", ""),
+                "title":     d.metadata.get("title", ""),
+                "summary":   d.metadata.get("summary", "") or d.page_content[:120],
+            })
+        return {
+            "message": "조건에 맞는 정책을 찾지 못했어요. 전국 공통 정책을 보여드릴게요.",
+            "fallback_policies": policies,
+            "user_info": user_info,
+        }
+
+    # 6) 정상 추천 -----------------------------------------------------
+    policies = []
+    for d in docs:
+        policies.append({
+            "policy_id": d.metadata.get("policy_id", ""),
+            "title":     d.metadata.get("title", ""),
+            "summary":   d.metadata.get("summary", "") or d.page_content[:120],
+            "apply_url": d.metadata.get("apply_url", ""),
+            "reason":    _compose_reason(d, user_info),
+        })
+
+    return {
+        "message": "추천 정책을 안내드립니다.",
+        "policies": policies,
+        "user_info": user_info,
+    }
