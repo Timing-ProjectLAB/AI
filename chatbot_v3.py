@@ -21,6 +21,12 @@ from tqdm import tqdm
 from functools import lru_cache
 import time
 
+# ─────────────────────────────────── #
+# 📌 In‑memory session store (user‑level)
+# ─────────────────────────────────── #
+from collections import defaultdict
+SESSION_STORE = defaultdict(lambda: {"user_info": None, "recommended_ids": set()})
+
 # 특수문자 제거, 소문자화 등을 통해 키워드 매칭에 방해가 되는 요소들을 제거하는 함수
 def clean_text_for_matching(text):
     return re.sub(r"[^\w\s]", "", text).replace("에", "").replace("에서", "").replace("인데", "").replace("야", "").strip()
@@ -1196,6 +1202,7 @@ def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
 
     return []
 
+
 # ─────────────────────────────────── #
 # 🔗 FastAPI 연동용 단일 요청 처리 함수
 # ─────────────────────────────────── #
@@ -1247,9 +1254,27 @@ def generate_policy_response(
     - 반환 형식은 업무 요청서에 명시된 JSON 구조를 따른다.
     """
 
-    # 1) 사용자 정보 추출 ---------------------------------------------
-    user_info                = extract_user_info(user_input)
-    age, region, interests   = user_info["age"], user_info["region"], user_info["interests"]
+    # ─────────────────────────────── #
+    # 👤 세션 메모리 로드 & 머지
+    # ─────────────────────────────── #
+    session               = SESSION_STORE[user_id]          # dict with 'user_info', 'recommended_ids'
+    prev_info             = session["user_info"] or {}
+    prev_recommended_ids  = session["recommended_ids"]
+
+    # 1) 새 입력에서 정보 추출
+    current_info = extract_user_info(user_input)
+
+    # 2) 이전 정보와 병합 (새 값이 있으면 덮어씀)
+    merged_info = prev_info.copy()
+    for k, v in current_info.items():
+        if v:  # 값이 None/빈 리스트/빈 문자열이 아니면
+            merged_info[k] = v
+
+    # 3) 이후 로직은 merged_info 사용
+    user_info = merged_info
+    age       = user_info.get("age")
+    region    = user_info.get("region")
+    interests = list(user_info.get("interests", []))  # copy
 
     # 2) 필수 정보 확인 -----------------------------------------------
     missing = []
@@ -1308,7 +1333,17 @@ def generate_policy_response(
         # 검색 오류 시 최소한의 질의로 재시도
         raw_docs = vectordb.similarity_search(user_input, k=50)
 
-    docs = filter_docs(raw_docs, age, search_query, region, interests)[:3]
+    docs = filter_docs(raw_docs, age, search_query, region, interests)
+
+    # 🔎 이전에 추천했던 정책은 제외
+    filtered_docs = []
+    for d in docs:
+        pid = d.metadata.get("policy_id")
+        if pid and pid not in prev_recommended_ids:
+            filtered_docs.append(d)
+        if len(filtered_docs) == 3:  # 최대 3건
+            break
+    docs = filtered_docs
 
     # 5) 결과가 없을 때 폴백 ------------------------------------------
     if not docs:
@@ -1320,6 +1355,9 @@ def generate_policy_response(
                 "title":     d.metadata.get("title", ""),
                 "summary":   d.metadata.get("summary", "") or d.page_content[:120],
             })
+        # 👉 세션 업데이트 (fallback도 기록)
+        session["recommended_ids"].update([p["policy_id"] for p in policies])
+        session["user_info"] = user_info
         return {
             "message": "조건에 맞는 정책을 찾지 못했어요. 전국 공통 정책을 보여드릴게요.",
             "fallback_policies": policies,
@@ -1336,6 +1374,13 @@ def generate_policy_response(
             "apply_url": d.metadata.get("apply_url", ""),
             "reason":    _compose_reason(d, user_info),
         })
+
+    # 👉 세션 업데이트
+    session["recommended_ids"].update([p["policy_id"] for p in policies])
+    session["user_info"] = user_info
+
+    # 병합
+    user_info["interests"] = interests
 
     return {
         "message": "추천 정책을 안내드립니다.",
