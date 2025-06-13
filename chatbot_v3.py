@@ -503,13 +503,20 @@ def load_or_build_vectorstore(json_path: str,
             "policy_id":        p.get("policy_id"),
             "title":            p["title"],
             "region":           ", ".join(p.get("region_name", [])),
-            "categories":       extract_categories(p.get("category", "")),
-            "keywords":         merged_keywords,
+            "categories":       ", ".join(extract_categories(p.get('category', ''))),
+            "keywords":         ", ".join(merged_keywords),
             "min_age":          safe_int(p.get("min_age")),
             "max_age":          safe_int(p.get("max_age"), 99),
             "income_condition": p.get("income_condition", "제한 없음"),
             "summary": (p.get("support_content") or p.get("description", ""))[:200],
-            "apply_period":     p.get("apply_period", ""),}   
+            "apply_period":     p.get("apply_period", ""),
+            "apply_url":        p.get("apply_url", ""),
+        }
+
+        # Ensure metadata values are primitive types for Chroma
+        for mk, mv in metadata.items():
+            if isinstance(mv, (list, set)):
+                metadata[mk] = ", ".join(map(str, mv))
 
         chunks = splitter.split_text(text)
         documents = [Document(page_content=chunk, metadata=metadata) for chunk in chunks]
