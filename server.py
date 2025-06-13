@@ -1,9 +1,16 @@
 from chatbot_v3 import generate_policy_response
 
-# 1st call
-print(generate_policy_response("kyle123",
-       "저는 26살 서울 거주 청년이에요. 취업 지원 정책이 궁금해요."))
+print(generate_policy_response("kyle123", "안녕하세요"))
+# → missing: age, region, interests
 
-# 2nd call (이어 질문)
-print(generate_policy_response("kyle123",
-       "다른 정책도 더 있을까요?"))
+print(generate_policy_response("kyle123", "나이는 26살이에요"))
+# → missing: region, interests
+
+print(generate_policy_response("kyle123", "지역은 제주도입니다."))
+# → missing: interests
+
+print(generate_policy_response("kyle123", "관심사는 주거 정책입니다."))
+# → 실제 정책 3건 반환
+
+print(generate_policy_response("kyle123", "나에게 맞는 정책 추천해줘"))
+# → 바로 정책 추천 (누락 없음)

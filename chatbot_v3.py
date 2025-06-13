@@ -1043,7 +1043,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 stored_interests
             )
 
-            docs = docs[:3]  # 상위 3건만
+            docs = docs[:1]  # 상위 1건만
 
         # ------ ② 출력 로직 ------
         if not docs:
@@ -1114,14 +1114,13 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             if not pid:
                 continue
             if pid in recommended_ids or pid in seen_ids:
-                continue              # 이미 보여줬거나 현재 리스트에 중복
+                continue  # 이미 보여줬거나 현재 리스트에 중복
             unique_docs.append(d)
             seen_ids.add(pid)
-            if len(unique_docs) == 3:
-                break
+            break  # ✅ 단 1건만 수집
 
-        # 추가 탐색: 중복 제거로 3건이 안 채워졌을 경우 raw_docs에서 보충 (seen_ids도 체크)
-        if len(unique_docs) < 3:
+        # 추가 탐색: 중복 제거로 1건이 안 채워졌을 경우 raw_docs에서 보충 (seen_ids도 체크)
+        if len(unique_docs) < 1:
             # raw_docs가 있을 때만
             extra_pool = [rd for rd in raw_docs
                           if rd.metadata.get("policy_id")
@@ -1130,7 +1129,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             for rd in extra_pool:
                 unique_docs.append(rd)
                 seen_ids.add(rd.metadata.get("policy_id"))
-                if len(unique_docs) == 3:
+                if len(unique_docs) == 1:
                     break
         # ------ ⏱ 응답 시간 측정 및 출력 ------
         # ⏱ end_time = time.time()
@@ -1277,6 +1276,10 @@ def generate_policy_response(
     interests = list(user_info.get("interests", []))  # copy
 
     # 2) 필수 정보 확인 -----------------------------------------------
+    # 👉 누적 정보를 세션에 즉시 저장해 부분 입력도 기억
+    session["user_info"] = user_info
+
+    # 누락 항목 식별
     missing = []
     if age is None:
         missing.append("age")
@@ -1286,8 +1289,11 @@ def generate_policy_response(
         missing.append("interests")
 
     if missing:
+        label_map = {"age": "나이", "region": "지역", "interests": "관심사"}
+        missing_kor = [label_map[m] for m in missing]
+        prompt_text = f"{', '.join(missing_kor)}를 알려주시면 맞춤형 정책을 추천해드릴게요."
         return {
-            "message": "나이, 지역, 관심사를 알려주시면 맞춤형 정책을 추천해드릴게요.",
+            "message": prompt_text,
             "missing_info": missing,
         }
 
@@ -1335,13 +1341,16 @@ def generate_policy_response(
 
     docs = filter_docs(raw_docs, age, search_query, region, interests)
 
-    # 🔎 이전에 추천했던 정책은 제외
+    # 🔎 이전에 추천했던 정책은 제외 + 중복 응답 차단
+    seen_ids = set()
     filtered_docs = []
     for d in docs:
         pid = d.metadata.get("policy_id")
-        if pid and pid not in prev_recommended_ids:
-            filtered_docs.append(d)
-        if len(filtered_docs) == 3:  # 최대 3건
+        if not pid or pid in prev_recommended_ids or pid in seen_ids:
+            continue
+        filtered_docs.append(d)
+        seen_ids.add(pid)
+        if len(filtered_docs) == 3:
             break
     docs = filtered_docs
 
