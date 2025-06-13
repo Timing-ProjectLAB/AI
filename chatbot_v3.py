@@ -646,18 +646,18 @@ SYSTEM = SystemMessagePromptTemplate.from_template("""
 6. 조건이 명확하지 않으면 조회량이 많은 전국 공통 정책 3건을 대신 추천하세요.
 
 [OUTPUT FORMAT - MARKDOWN]
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
-- **정책명** (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
+- 정책명 (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
+- 정책명 (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
+- 정책명 (소득: ○○): 지원내용 요약 — 추천 이유 (링크 : apply_url) (정첵ID : policy_id)
 
 [EXCEPTION]
 - 조건에 맞는 정책이 없을 경우:
     대신 전국 공통 정책 3건을 출력하세요.
 
 [EXAMPLE - NORMAL]
-- **청년내일채움공제** (소득: 제한 없음): 중소기업 근무 청년에게 목돈 마련 지원 — 나이와 소득 조건 모두 부합 (출처: policy_123)
-- **국민취업지원제도** (소득: 기준중위소득 100% 이하): 취업준비 중 청년에게 맞춤형 취업지원 — 관심사 '취업'과 일치 (출처: policy_456)
-- **청년구직활동지원금** (소득: 기준중위소득 120% 이하): 구직활동비 월 최대 50만원 지원 — 지역, 관심사 모두 일치 (출처: policy_789)
+- 청년내일채움공제 (소득: 제한 없음): 중소기업 근무 청년에게 목돈 마련 지원 — 나이와 소득 조건 모두 부합 (출처: policy_123)
+- 국민취업지원제도 (소득: 기준중위소득 100% 이하): 취업준비 중 청년에게 맞춤형 취업지원 — 관심사 '취업'과 일치 (출처: policy_456)
+- 청년구직활동지원금 (소득: 기준중위소득 120% 이하): 구직활동비 월 최대 50만원 지원 — 지역, 관심사 모두 일치 (출처: policy_789)
 
 [EXAMPLE - FALLBACK]
 해당 조건에 맞는 정책이 없습니다. 대신 전국 공통 정책 3건을 추천합니다.
@@ -1376,11 +1376,19 @@ def generate_policy_response(
     # 6) 정상 추천 -----------------------------------------------------
     policies = []
     for d in docs:
+        apply_url = d.metadata.get("apply_url", "")
+        if not apply_url:
+            # 🔎 페이지 본문이나 요약에서 URL 패턴 추출
+            m = re.search(r"https?://[^\s)]+", d.page_content)
+            if not m:
+                m = re.search(r"https?://[^\s)]+", d.metadata.get("summary", ""))
+            if m:
+                apply_url = m.group(0)
         policies.append({
             "policy_id": d.metadata.get("policy_id", ""),
             "title":     d.metadata.get("title", ""),
             "summary":   d.metadata.get("summary", "") or d.page_content[:120],
-            "apply_url": d.metadata.get("apply_url", ""),
+            "apply_url": apply_url,
             "reason":    _compose_reason(d, user_info),
         })
 
