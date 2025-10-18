@@ -4,3 +4,4 @@ kwdb/
 categorydb/
 .venv/
 __pycache__/
+/.AGENTS.md

@@ -110,6 +110,19 @@ def is_policy_related_question_llm(text: str) -> bool:
     if len(cleaned) == 1 or re.fullmatch(r"[ㅋㅎ]+", cleaned):
         return False
 
+    # ④ '정책' 명시, 나이·지역·관심 표현이 있으면 즉시 정책 관련으로 분류
+    if "정책" in cleaned:
+        return True
+    if re.search(r"\d{1,2}\s*(세|살)", cleaned):
+        return True
+    if any(keyword in cleaned for keyword in ["나이", "지역", "관심"]):
+        return True
+
+    # ⑤ 파서가 핵심 조건을 추출하면 정책 맥락으로 간주
+    parsed_age, parsed_region, parsed_interests = parse_user_input(text)
+    if parsed_age or parsed_region or parsed_interests:
+        return True
+
     system_msg = (
         "너는 대한민국 청년 정책 상담 챗봇의 분류기야. "
         "아래 사용자 입력이 정책과 *관련된 질문*인지 판단해. "
@@ -118,7 +131,7 @@ def is_policy_related_question_llm(text: str) -> bool:
     user_msg = f"사용자 입력: {cleaned}\n\n정책 관련 질문인가?"
 
     try:
-        resp = openai.ChatCompletion.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": system_msg},
@@ -127,7 +140,8 @@ def is_policy_related_question_llm(text: str) -> bool:
             temperature=0,
             max_tokens=1,
         )
-        return resp.choices[0].message.content.strip().upper().startswith("Y")
+        content = resp.choices[0].message.content if resp.choices else ""
+        return (content or "").strip().upper().startswith("Y")
     except Exception:
         # 네트워크/쿼터 문제 시 휴리스틱으로 폴백
         return is_policy_related_question(cleaned)
@@ -161,7 +175,19 @@ def is_region_keyword(word: str) -> bool:
 
 # 사용자 입력에서 정보 자동 추출 함수
 def extract_user_info(user_input: str):
-    info = {"age": None, "region": None, "interests": [], "status": None, "income": None}
+    info = {
+        "age": None,
+        "region": None,
+        "interests": [],
+        "status": None,
+        "income": None,
+        "gender": None,
+        "education": None,
+        "desired_job": None,
+        "hope_region": None,
+        "family": None,
+        "special": None,
+    }
 
     # ✅ 전처리: 마침표, 쉼표 등 제거 → '여주에 사는 25살이야'로 만들기
     clean_text = re.sub(r"[^\w가-힣]", " ", user_input)
@@ -178,12 +204,63 @@ def extract_user_info(user_input: str):
         info["status"] = "대학생"
     elif "취준생" in user_input or "취업 준비" in user_input:
         info["status"] = "취업준비생"
+    elif "졸업생" in user_input or "졸업 예정" in user_input:
+        info["status"] = "졸업예정자"
+    elif "재직" in user_input or "직장인" in user_input or "근무 중" in user_input:
+        info["status"] = "재직자"
+    elif "프리랜서" in user_input or "프리랜서" in clean_text:
+        info["status"] = "프리랜서"
 
     # 소득
     if "저소득" in user_input:
         info["income"] = "저소득층"
     elif "고소득" in user_input:
         info["income"] = "고소득층"
+    else:
+        m_income = re.search(r"(?:중위\s*소득|소득)\s*(\d{2,3})\s*%", user_input)
+        if m_income:
+            info["income"] = f"중위소득 {m_income.group(1)}%"
+
+    # 성별
+    if "여자" in user_input or "여성" in user_input:
+        info["gender"] = "여성"
+    elif "남자" in user_input or "남성" in user_input:
+        info["gender"] = "남성"
+
+    # 학력/전공
+    edu_match = re.search(r"([가-힣A-Za-z]+과)\s*(?:를)?\s*(?:전공|졸업|졸업할|졸업 예정)", user_input)
+    if edu_match:
+        info["education"] = f"{edu_match.group(1)} 전공"
+    elif "졸업" in user_input:
+        info["education"] = "졸업/졸업 예정"
+    elif "재학" in user_input:
+        info["education"] = "재학 중"
+
+    # 희망 직무
+    desired_jobs = ["개발자", "디자이너", "간호사", "엔지니어", "교사", "연구원", "마케터", "공무원", "데이터 분석가"]
+    for job in desired_jobs:
+        if job in user_input:
+            info["desired_job"] = job
+            break
+
+    # 희망 근무 지역
+    if any(keyword in user_input for keyword in ["근무", "일하고", "취업", "취직", "일자리"]):
+        hoped_region = extract_region(user_input, REGION_MAPPING)
+        if hoped_region:
+            info["hope_region"] = hoped_region
+
+    # 가족/부양 정보
+    if "자녀" in user_input or "아이" in user_input or "육아" in user_input:
+        info["family"] = "자녀 있음"
+    elif "기혼" in user_input or "결혼" in user_input or "신혼" in user_input:
+        info["family"] = "기혼"
+
+    # 특별 대상
+    special_keywords = ["장애", "국가유공", "보훈", "다문화", "군필", "전역"]
+    for sk in special_keywords:
+        if sk in user_input:
+            info["special"] = sk
+            break
 
     return info
 
@@ -209,8 +286,8 @@ def print_result(idx, doc):
 from dotenv import load_dotenv
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY", "")
-import openai
-openai.api_key = api_key
+from openai import OpenAI
+client = OpenAI(api_key=api_key) if api_key else OpenAI()
 embedding = OpenAIEmbeddings()
 # Load keyword vectorstore (ensure it's built with keyword terms only)
 keyword_vectordb = Chroma(persist_directory="./kwdb", embedding_function=embedding)
@@ -380,6 +457,36 @@ REGION_MAPPING = {
     ]
 }
 
+REGION_ALIASES = {
+    "서울": [
+        "강남", "강남역", "강남구", "잠실", "잠실역", "송파", "송파역", "압구정", "압구정로데오",
+        "홍대", "홍대입구", "홍대입구역", "합정", "합정역", "상암", "상암동", "상암디엠씨", "여의도", "여의나루",
+        "신촌", "이태원", "한남", "한남동", "건대", "건대입구", "성수", "성수동", "왕십리", "왕십리역",
+        "마포", "마포구", "종로", "광화문", "서초", "서초구", "노량진", "노량진역"
+    ],
+    "경기": [
+        "성남", "성남시", "분당", "판교", "판교역", "정자동", "수내", "야탑", "서현",
+        "용인", "기흥", "수지", "죽전", "광교", "광교역", "수원", "일산", "일산동구",
+        "일산서구", "덕이", "주엽", "대화", "탄현", "부천", "부천시", "오정", "상동",
+        "중동", "광명", "안양", "평택", "의정부", "하남", "김포", "포천"
+    ],
+    "인천": ["송도", "송도국제도시", "청라", "청라국제도시", "영종", "구월", "부평", "계양"],
+    "부산": ["해운대", "해운대구", "해운대역", "광안리", "광안", "서면", "남포", "남포동", "동래", "센텀"],
+    "대구": ["동성로", "수성", "달서", "칠성", "대명"],
+    "광주": ["상무", "상무지구", "첨단", "송정"],
+    "대전": ["둔산", "둔산동", "유성", "탄방"],
+    "울산": ["삼산", "삼산동", "태화", "무거"],
+    "세종": ["어진동", "나성동", "호수공원", "세종시청"],
+    "강원": ["원주", "춘천", "강릉", "속초", "평창", "홍천"],
+    "충북": ["청주", "청원", "충주", "제천", "오창"],
+    "충남": ["천안", "아산", "홍성", "서산", "당진", "예산"],
+    "전북": ["전주", "전주혁신", "익산", "군산", "완주"],
+    "전남": ["순천", "여수", "광양", "목포", "무안"],
+    "경북": ["포항", "구미", "경주", "영주", "안동"],
+    "경남": ["창원", "김해", "진주", "거제", "통영", "양산"],
+    "제주": ["서귀포", "애월", "조천", "한림", "성산", "표선", "제주시"]
+}
+
 # ---- 단일 키워드 및 'OO시' 변형 자동 추가 ----
 # 각 표준 지역명 자체(예: '서울', '경기')와 흔히 쓰는 '○○시' 변형을 REGION_MAPPING 리스트에 자동 포함시켜
 # 단일 키워드 입력도 인식하도록 확장합니다.
@@ -402,10 +509,46 @@ for std_region, full_names in REGION_MAPPING.items():
             if token not in REVERSE_REGION_LOOKUP:
                 REVERSE_REGION_LOOKUP[token] = std_region
 
-            # ‘여주시’ → ‘여주’처럼 접미사(시·군·구) 제거 버전도 매핑
-            core_tok = re.sub(r"(시|군|구)$", "", token)
-            if core_tok and core_tok not in REVERSE_REGION_LOOKUP:
-                REVERSE_REGION_LOOKUP[core_tok] = std_region
+            stripped = re.sub(r"(특별자치도|특별자치시|특별시|광역시)$", "", token)
+            if stripped and stripped not in REVERSE_REGION_LOOKUP:
+                REVERSE_REGION_LOOKUP[stripped] = std_region
+
+            base_tok = re.sub(r"(시|군|구|동|읍|면|리)$", "", stripped)
+            if base_tok and base_tok not in REVERSE_REGION_LOOKUP:
+                REVERSE_REGION_LOOKUP[base_tok] = std_region
+
+            city_match = re.match(r"([가-힣]+시)", token)
+            if city_match:
+                city = city_match.group(1)
+                if city not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[city] = std_region
+                city_base = re.sub(r"(특별시|광역시|시)$", "", city)
+                if city_base and city_base not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[city_base] = std_region
+
+            county_matches = re.findall(r"[가-힣]+군", token)
+            for county in county_matches:
+                if county not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[county] = std_region
+                county_base = re.sub(r"군$", "", county)
+                if county_base and county_base not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[county_base] = std_region
+
+            district_matches = re.findall(r"[가-힣]+구", token)
+            for district in district_matches:
+                if district not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[district] = std_region
+                district_base = re.sub(r"구$", "", district)
+                if district_base and district_base not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[district_base] = std_region
+
+            town_matches = re.findall(r"[가-힣]+동", token)
+            for town in town_matches:
+                if town not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[town] = std_region
+                town_base = re.sub(r"동$", "", town)
+                if town_base and town_base not in REVERSE_REGION_LOOKUP:
+                    REVERSE_REGION_LOOKUP[town_base] = std_region
 
         # 전체 명칭도 직접 매핑
         if name not in REVERSE_REGION_LOOKUP:
@@ -416,6 +559,14 @@ REVERSE_REGION_LOOKUP.setdefault("제주", "제주")
 REVERSE_REGION_LOOKUP.setdefault("제주도", "제주")
 REVERSE_REGION_LOOKUP.setdefault("서울", "서울")
 REVERSE_REGION_LOOKUP.setdefault("서울시", "서울")
+
+for std_region, aliases in REGION_ALIASES.items():
+    for alias in aliases:
+        if alias and alias not in REVERSE_REGION_LOOKUP:
+            REVERSE_REGION_LOOKUP[alias] = std_region
+        compact = alias.replace(" ", "")
+        if compact and compact not in REVERSE_REGION_LOOKUP:
+            REVERSE_REGION_LOOKUP[compact] = std_region
 
 # ─────────────────────────────────── #
 # 2. 정책 키워드 · 카테고리
@@ -539,7 +690,7 @@ def clean_user_input(text: str) -> str:
 # 조사 등을 제거하고 핵심 단어(예: '여주에' → '여주') 추출
 def normalize_korean_tokens(text: str) -> List[str]:
     """
-    조사·행정구역 접미사(시·군·구) 제거 후 핵심 단어 추출
+    조사·행정구역 접미사(시·군·구·동·읍·면·리) 제거 후 핵심 단어 추출
     """
     tokens = re.findall(r"[가-힣]{2,}", text)
     normalized = []
@@ -547,7 +698,7 @@ def normalize_korean_tokens(text: str) -> List[str]:
         # 조사 제거
         core = re.sub(r"(에|에서|에게|로|으로|의|를|을|이|가|은|는|도|만|이나|까지|부터)$", "", tok)
         # 행정구역 접미사 제거
-        core = re.sub(r"(시|군|구)$", "", core)
+        core = re.sub(r"(시|군|구|동|읍|면|리)$", "", core)
         if core and core not in normalized:
             normalized.append(core)
     return normalized
@@ -558,6 +709,11 @@ def extract_region(user_input: str, REGION_MAPPING: dict) -> str:
     for std_region, keywords in REGION_MAPPING.items():
         for keyword in keywords:
             if keyword in cleaned_input:
+                return std_region
+    for std_region, aliases in REGION_ALIASES.items():
+        for alias in aliases:
+            compact = alias.replace(" ", "")
+            if alias in cleaned_input or compact in cleaned_input:
                 return std_region
     return ""
 
@@ -587,6 +743,11 @@ def parse_user_input(text: str) -> Tuple[Optional[int], Optional[str], Optional[
         if any(keyword in text for keyword in keywords):
             region = std_region
             break
+    if not region:
+        for std_region, aliases in REGION_ALIASES.items():
+            if any(alias in text for alias in aliases):
+                region = std_region
+                break
     # Fallback: 단일 토큰 기반 지역 추출
     if not region:
         for token in normalize_korean_tokens(text):
@@ -718,7 +879,7 @@ def jaccard_similarity(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List[str]):
+def filter_docs(docs,user_age: Optional[int], user_text: str, region: str, interests: List[str]):
     """
     docs        : LangChain Document 리스트
     user_age    : 나이 조건
@@ -735,9 +896,10 @@ def filter_docs(docs,user_age: int, user_text: str, region: str, interests: List
         # 0. 나이 필터 : 메타데이터가 없다면 통과
         # ─────────────────────── #
         min_age = d.metadata.get("min_age", 0)
-        max_age = d.metadata.get("max_age",999)
-        if user_age not in range(min_age, max_age + 1):
-            continue
+        max_age = d.metadata.get("max_age", 999)
+        if user_age is not None and user_age > 0:
+            if not (min_age <= user_age <= max_age):
+                continue
 
         # ─────────────────────── #
         # 1. 지역 점수 (R: 0 | 0.5 | 1)
@@ -870,82 +1032,235 @@ def prompt_sub_interest(main_interest: str) -> Optional[str]:
 # ─────────────────────────────────── #
 # 8. 콘솔 채팅
 # ─────────────────────────────────── #
+
+
 def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, policy_vectordb=None):
     print("\n챗봇이 시작되었습니다. 종료하려면 '종료'를 입력하세요.\n")
+
+    exit_terms = {"종료", "exit", "quit"}
+    confirm_terms = {"네", "예", "yes", "y"}
+    confirm_all_terms = {"전체", "전부", "all"}
+    more_terms = {"더", "more"}
 
     stored_age = None
     stored_region = None
     stored_interests = []
-    # 이미 사용자에게 보여준 정책ID 집합
+    stored_income = None
+    stored_status = None
+    stored_gender = None
+    stored_education = None
+    stored_desired_job = None
+    stored_hope_region = None
+    stored_family = None
+    stored_special = None
+
     recommended_ids = set()
+    pending_full_docs = []
+    pending_total = 0
 
-    # Ensure vectordb refers to main policy vectorstore
-    vectordb = policy_vectordb if policy_vectordb is not None else policy_vectordb
+    vectordb = policy_vectordb if policy_vectordb is not None else globals().get("policy_vectordb")
+    if vectordb is None:
+        print("Bot: 정책 데이터베이스를 찾지 못했습니다. 벡터스토어를 먼저 빌드해 주세요.")
+        return
 
-    # ⏱ total_response_time = 0 # 응답시간 계산 나중에 제거하기
-    # ⏱ response_count = 0 # 응답 횟수 나중에 제거
-    def is_new_topic(predicted: list[str], stored: list[str]) -> bool:
-        return not any(kw in stored for kw in predicted)
+    OPTIONAL_FIELD_LABELS = {
+        "income": "소득 분위",
+        "status": "고용 상태",
+        "education": "학력·전공",
+        "desired_job": "희망 직무",
+        "hope_region": "희망 근무 지역",
+        "family": "가족·부양 정보",
+        "special": "특별 대상 여부",
+        "gender": "성별",
+    }
+
+    def detect_top_interests(text: str) -> list[str]:
+        matches = []
+        lowered = text.lower()
+        for std_i, kws in INTEREST_MAPPING.items():
+            if std_i in text and std_i not in matches:
+                matches.append(std_i)
+                continue
+            for kw in kws:
+                if kw in text or kw.lower() in lowered:
+                    if std_i not in matches:
+                        matches.append(std_i)
+                    break
+        return matches
+
+    def current_profile() -> dict:
+        return {
+            "age": stored_age,
+            "region": stored_region,
+            "interests": stored_interests[:],
+            "income": stored_income,
+            "status": stored_status,
+            "gender": stored_gender,
+            "education": stored_education,
+            "desired_job": stored_desired_job,
+            "hope_region": stored_hope_region,
+            "family": stored_family,
+            "special": stored_special,
+        }
+
+    def apply_user_text(text: str) -> dict:
+        nonlocal stored_age, stored_region, stored_interests
+        nonlocal stored_income, stored_status, stored_gender
+        nonlocal stored_education, stored_desired_job, stored_hope_region
+        nonlocal stored_family, stored_special
+
+        info = extract_user_info(text)
+        if info["age"]:
+            stored_age = info["age"]
+        if info["region"]:
+            stored_region = info["region"]
+        if info["income"]:
+            stored_income = info["income"]
+        if info["status"]:
+            stored_status = info["status"]
+        if info["gender"]:
+            stored_gender = info["gender"]
+        if info["education"]:
+            stored_education = info["education"]
+        if info["desired_job"]:
+            stored_desired_job = info["desired_job"]
+        if info["hope_region"]:
+            stored_hope_region = info["hope_region"]
+        if info["family"]:
+            stored_family = info["family"]
+        if info["special"]:
+            stored_special = info["special"]
+
+        if info["interests"]:
+            for interest in info["interests"]:
+                if interest and interest not in stored_interests:
+                    stored_interests.append(interest)
+
+        for match in detect_top_interests(text):
+            if match not in stored_interests:
+                stored_interests.append(match)
+
+        return current_profile()
+
+    def print_profile_snapshot(profile: dict):
+        interests_text = ", ".join(profile["interests"]) if profile["interests"] else "-"
+        essentials = f"[🧠 수집 정보] 나이: {profile['age'] or '-'}, 지역: {profile['region'] or '-'}, 관심사: {interests_text}"
+        extras = []
+        if profile["status"]:
+            extras.append(f"고용 상태: {profile['status']}")
+        if profile["income"]:
+            extras.append(f"소득: {profile['income']}")
+        if profile["education"]:
+            extras.append(f"학력·전공: {profile['education']}")
+        if profile["desired_job"]:
+            extras.append(f"희망 직무: {profile['desired_job']}")
+        if profile["hope_region"] and profile["hope_region"] != profile["region"]:
+            extras.append(f"희망 근무 지역: {profile['hope_region']}")
+        if profile["gender"]:
+            extras.append(f"성별: {profile['gender']}")
+        if profile["family"]:
+            extras.append(f"가족·부양: {profile['family']}")
+        if profile["special"]:
+            extras.append(f"특별 대상: {profile['special']}")
+        if extras:
+            print(f"{essentials}\n[ℹ️ 추가 정보] " + ", ".join(extras))
+        else:
+            print(essentials)
+
+    def missing_optional_fields() -> list[str]:
+        profile = current_profile()
+        labels = []
+        for key, label in OPTIONAL_FIELD_LABELS.items():
+            if not profile.get(key):
+                labels.append(label)
+        return labels
+
+    def prompt_required(missing_labels: list[str]):
+        optional = missing_optional_fields()
+        lines = ["사용자님을 위한 정책을 안내드리기 위해 몇 가지 정보가 필요해요."]
+        lines.append("필수 정보: " + ", ".join(missing_labels))
+        if optional:
+            lines.append("추가로 " + ", ".join(optional) + " 등을 알려주시면 더 정확한 추천이 가능해요.")
+        print("Bot:\\n" + "\\n".join(lines) + "\\n")
+
+    def display_policies(docs: list, limit: int = 10):
+        nonlocal recommended_ids
+        profile = current_profile()
+        if not docs:
+            print("Bot:\\n표시할 정책이 없어요. 다른 조건을 알려주세요!\\n")
+            return
+        print("Bot:\\n맞춤 정책을 안내드릴게요!")
+        for idx, doc in enumerate(docs[:limit], 1):
+            pid = doc.metadata.get("policy_id", "")
+            title = doc.metadata.get("title", "알 수 없는 정책")
+            summary = doc.metadata.get("summary") or doc.page_content[:120]
+            apply_url = doc.metadata.get("apply_url", "")
+            if not apply_url:
+                m = re.search(r"https?://[^\s)]+", doc.page_content)
+                if not m:
+                    m = re.search(r"https?://[^\s)]+", summary or "")
+                if m:
+                    apply_url = m.group(0)
+            reason = _compose_reason(doc, profile)
+            print(f"{idx}. {title} (정책ID: {pid})")
+            print(f"   요약: {summary.strip()}")
+            if apply_url:
+                print(f"   신청 링크: {apply_url}")
+            if reason:
+                print(f"   추천 이유: {reason}")
+            if pid:
+                recommended_ids.add(pid)
+        if len(docs) > limit:
+            print(f"\n※ 총 {len(docs)}건 중 상위 {limit}건만 표시했어요. 더 보시려면 '전체'라고 입력해 주세요.")
+        print("\n다른 조건이 있다면 계속 말씀해 주세요!")
+
+    REQUIRED_LABELS = [("age", "나이"), ("region", "주거 지역"), ("interests", "관심 분야")]
 
     while True:
         user_input = input("You: ")
-        if user_input.strip().lower() in ["종료", "exit", "quit"]:
+        trimmed = user_input.strip()
+        normalized = re.sub(r"[.!?]+$", "", trimmed.lower())
+
+        if pending_full_docs and normalized in confirm_terms:
+            display_policies(pending_full_docs)
+            pending_full_docs = []
+            pending_total = 0
+            continue
+        if pending_full_docs and normalized in confirm_all_terms:
+            display_policies(pending_full_docs, limit=len(pending_full_docs))
+            pending_full_docs = []
+            pending_total = 0
+            continue
+        if pending_full_docs and normalized in more_terms:
+            display_policies(pending_full_docs, limit=min(len(pending_full_docs), 20))
+            pending_full_docs = []
+            pending_total = 0
+            continue
+
+        if normalized in exit_terms:
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
 
-
-        # 사용자가 '다른 정책' 등 추가 추천만 요청했는지 플래그
         force_more_request = is_generic_more_request(user_input)
-
-        # 사용자가 '어떤 분야'를 물으면 현재 가능한 카테고리 제안
-        if re.search(r"어떤\s*분야.*(있|야|가)", user_input):
-            suggestion = suggest_remaining_interests(stored_interests)
-            print(f"Bot:\n현재 선택할 수 있는 분야로는 {suggestion}이 있습니다.\n")
-            continue
-
         if not force_more_request and not is_policy_related_question_llm(user_input):
-            print("Bot:\n저는 대한민국 청년 정책 안내를 도와드리는 챗봇이에요! 정책 관련 질문을 해주세요 😊\n")
+            print("Bot:\\n저는 대한민국 청년 정책 안내를 도와드리는 챗봇이에요! 정책 관련 질문을 해주세요 😊\\n")
             continue
 
-        # 유효 질문인지 검사 (단, '다른 정책' 추가 요청은 건너뜀)
-        age, region, interests = parse_user_input(user_input)
-        if not force_more_request and not is_valid_query(user_input) and not any([age, region, interests]):
-            print("Bot:\n안녕하세요! 궁금하신 정책이나 조건을 입력해 주세요 🙂\n")
-            continue
+        apply_user_text(user_input)
 
-        # 사용자 입력에서 자동 정보 추출 및 출력
-        user_info = extract_user_info(user_input)
-        print(f"[🧠 자동 추출 정보] 나이: {user_info['age']}, 지역: {user_info['region']}, 관심사: {user_info['interests']}, 상태: {user_info['status']}, 소득: {user_info['income']}")
-
-        # extract_user_info의 출력값을 그대로 반영
-        if user_info['age']:
-            stored_age = user_info['age']
-        if user_info['region']:
-            stored_region = user_info['region']
-        if user_info['interests']:
-            stored_interests = user_info['interests']
-
-        # 💡 정보가 모두 없으면 바로 안내하고 다음 입력 대기
-        if not any([stored_age, stored_region, stored_interests]):
-            print("Bot:\n나이, 지역, 관심사 정보를 알려주시면 맞춤형 정책을 안내해드릴게요 😊\n")
-            continue
-
-        # ⏱ start_time = time.time()  # 응답 시간 측정 시작 (위치 이동) # 추후 제거
-
-        # 관심사 추론
         predicted_keywords = None
-        embedding = None
+        embedding_model = None
         if keyword_vectordb:
-            embedding = OpenAIEmbeddings()
-            query_vector = embedding.embed_query(user_input)
+            embedding_model = OpenAIEmbeddings()
+            query_vector = embedding_model.embed_query(user_input)
             docs = keyword_vectordb.similarity_search_by_vector(query_vector, k=3)
             if docs:
                 predicted_keywords = [doc.page_content for doc in docs]
 
         if not predicted_keywords and category_vectordb:
-            if embedding is None:
-                embedding = OpenAIEmbeddings()
-            query_vector = embedding.embed_query(user_input)
+            if embedding_model is None:
+                embedding_model = OpenAIEmbeddings()
+            query_vector = embedding_model.embed_query(user_input)
             docs = category_vectordb.similarity_search_by_vector(query_vector, k=2)
             if docs:
                 predicted_keywords = [doc.page_content for doc in docs]
@@ -955,7 +1270,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             prompt = PromptTemplate.from_template("""
             [시스템]
             다음 문장에서 관련 있는 관심사를 추출하세요.
-            선택 가능한 항목: 창업, 취업, 금융, 복지, 교육, 공간, 문화예술
+            선택 가능한 항목: 창업, 취업, 금융, 복지, 교육, 공간, 문화예술, 주거, 정신건강, 인턴십
 
             문장:
             {input}
@@ -965,210 +1280,115 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             response = llm.invoke(prompt.format(input=user_input).to_messages())
             predicted_keywords = [i.strip() for i in response.content.split(",") if i.strip()]
 
-        # ─────────────────────────────────────── #
-        # 🔧 예측 키워드 → 표준 관심사 매핑 개선
-        # - 벡터DB에서 가져온 '제주시', '거주자' 같은 토큰 제거
-        # - INTEREST_MAPPING에 정의된 키워드만 표준화해 사용
-        # ─────────────────────────────────────── #
         if predicted_keywords:
             std_interests = []
             for kw in predicted_keywords:
-                # 먼저, 지역 키워드는 제외
                 if is_region_keyword(kw):
                     continue
-                # 표준 관심사명 그대로 들어온 경우
-                if kw in INTEREST_MAPPING:
-                    if kw not in std_interests:
-                        std_interests.append(kw)
+                if kw in INTEREST_MAPPING and kw not in std_interests:
+                    std_interests.append(kw)
                     continue
-                # 키워드가 INTEREST_MAPPING 하위 키워드에 포함되는지 확인
                 for std_i, kws in INTEREST_MAPPING.items():
                     if kw in kws and std_i not in std_interests:
                         std_interests.append(std_i)
                         break
-            # 매핑 결과가 없다면 예측 키워드 무시
             predicted_keywords = std_interests if std_interests else None
 
-        # 관심사 초기화 조건 체크 및 저장
         if predicted_keywords:
-            if is_new_topic(predicted_keywords, stored_interests):
-                print("🧹 기존 관심사를 초기화합니다.")
-                new_interests = predicted_keywords
-            else:
-                new_interests = stored_interests[:]
+            new_topic = any(kw not in stored_interests for kw in predicted_keywords)
+            if new_topic:
+                stored_interests = [kw for kw in stored_interests if not is_region_keyword(kw)]
                 for kw in predicted_keywords:
-                    if kw not in new_interests:
-                        new_interests.append(kw)
+                    if kw not in stored_interests:
+                        stored_interests.append(kw)
+            print(f"[🔍 추론된 관심사] → {predicted_keywords}")
 
-            # 지역명을 관심사에서 제거
-            filtered_interests = [kw for kw in new_interests if not is_region_keyword(kw)]
-            if filtered_interests:
-                stored_interests = filtered_interests
-            # stored_interests = new_interests  # 기존 직접 대입은 제거/주석 처리
+        print_profile_snapshot(current_profile())
 
-        print(f"[🔍 추론된 관심사] → {predicted_keywords}")
-        print(f"[📌 누적 정보] 나이: {stored_age}, 지역: {stored_region}, 관심사: {stored_interests}" )
-
-        # 누적 직후, 사용자 정보가 여전히 모두 비어있다면 추천 차단
-        # 수정: 새로 추출된 값이 있으면 추천 흐름 진입하도록 조건 강화
-        age = user_info['age']
-        region = user_info['region']
-        interests = user_info['interests']
-
-        # ------ ① 벡터 검색 & 선별 ------
-        filters_keywords_only = {
-            "categories": {"$in": stored_interests}
-        } if stored_interests else None
-
-        docs = []
-        if vectordb is not None:
-            try:
-                # 만약 '다른 정책' 같은 일반 요청이면 누적 정보를 사용해 질의 재구성
-                search_query = user_input
-                if force_more_request:
-                    search_query = build_query("추천", stored_age, stored_region, stored_interests)
-                    # 추가 요청 시 필터 없이 더 많은 후보 검색
-                    raw_docs = vectordb.similarity_search(search_query, k=50)
-                else:
-                    raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
-            except Exception:
-                search_query = user_input
-                if force_more_request:
-                    search_query = build_query("추천", stored_age, stored_region, stored_interests)
-                    raw_docs = vectordb.similarity_search(search_query, k=50)
-                else:
-                    raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
-
-            # ✅ 지역·나이·관심사 기반 스코어링
-            user_age_for_score = stored_age if stored_age else 0
-            user_region_for_score = stored_region if stored_region else ""
-            docs = filter_docs(
-                raw_docs,
-                user_age_for_score,
-                search_query,
-                user_region_for_score,
-                stored_interests
-            )
-
-            docs = docs[:1]  # 상위 1건만
-
-        # ------ ② 출력 로직 ------
-        if not docs:
-            #print("\nBot:\n현재 조건에 딱 맞는 정책이 보이지 않아요.")
-
-            # 1) 주요/추론 관심사 파악
-            main_interest = stored_interests[0] if stored_interests else None
-            if not main_interest:
-                # 사용자 입력에서 INTEREST_MAPPING 키워드 스캔
-                for std_i, kws in INTEREST_MAPPING.items():
-                    if any(k in user_input for k in kws):
-                        main_interest = std_i
-                        break
-
-            # 2) 세부 관심사 질문 (SUB_INTEREST_MAPPING 이용)
-            clarified = False
-            if main_interest:
-                sub_map = SUB_INTEREST_MAPPING.get(main_interest)
-                if sub_map:
-                    sub_options = ", ".join(sub_map.keys())
-                    ask = f"{main_interest}과 관련해 어떤 지원을 찾고 계신가요? (예: {sub_options}) : "
-                    sub_choice = input(ask).strip()
-                    if sub_choice:
-                        if sub_choice not in stored_interests:
-                            stored_interests.append(sub_choice)
-                        refined_query = f"{user_input} {sub_choice}"
-                        raw_docs = vectordb.similarity_search(refined_query, k=50)
-                        docs = filter_docs(
-                            raw_docs,
-                            stored_age if stored_age else 0,
-                            refined_query,
-                            stored_region if stored_region else "",
-                            stored_interests
-                        )
-                        docs = docs[:3]
-                        clarified = True
-
-            # 3) 일반 관심사 질문 (세부 관심사 실패 또는 매핑 없음)
-            if not clarified:
-                suggestion_list = suggest_remaining_interests(stored_interests)
-                prompt_text = f"어떤 분야의 정책을 찾고 계신가요? (예: {suggestion_list}): "
-                generic_choice = input(prompt_text).strip()
-                if generic_choice:
-                    if generic_choice not in stored_interests:
-                        stored_interests.append(generic_choice)
-                    start_time = time.time()  # ⏱ reset timer after user input
-                    refined_query = f"{user_input} {generic_choice}"
-                    raw_docs = vectordb.similarity_search(refined_query, k=50)
-                    docs = filter_docs(
-                        raw_docs,
-                        stored_age if stored_age else 0,
-                        refined_query,
-                        stored_region if stored_region else "",
-                        stored_interests
-                    )
-                    docs = docs[:3]
-
-            # 4) 최종 폴백: 전국 공통 정책
-            if not docs:
-                print("조건에 맞는 정책이 없어 전국 공통 정책 3건을 대신 보여드릴게요.\n")
-                docs = vectordb.similarity_search("청년 정책 전국 공통", k=3)
-
-        # 👉 이미 제시한 정책은 제외하고 최대 3건까지 출력, 중복 제거 강화
-        unique_docs = []
-        seen_ids = set()              # 중복 제거용(현재 회차)
-        for d in docs:
-            pid = d.metadata.get("policy_id")
-            if not pid:
-                continue
-            if pid in recommended_ids or pid in seen_ids:
-                continue  # 이미 보여줬거나 현재 리스트에 중복
-            unique_docs.append(d)
-            seen_ids.add(pid)
-            break  # ✅ 단 1건만 수집
-
-        # 추가 탐색: 중복 제거로 1건이 안 채워졌을 경우 raw_docs에서 보충 (seen_ids도 체크)
-        if len(unique_docs) < 1:
-            # raw_docs가 있을 때만
-            extra_pool = [rd for rd in raw_docs
-                          if rd.metadata.get("policy_id")
-                          and rd.metadata.get("policy_id") not in recommended_ids
-                          and rd.metadata.get("policy_id") not in seen_ids]
-            for rd in extra_pool:
-                unique_docs.append(rd)
-                seen_ids.add(rd.metadata.get("policy_id"))
-                if len(unique_docs) == 1:
-                    break
-        # ------ ⏱ 응답 시간 측정 및 출력 ------
-        # ⏱ end_time = time.time()
-        # ⏱ elapsed = end_time - start_time
-        # ⏱ total_response_time += elapsed
-        # ⏱ response_count += 1
-
-        # ⏱ print(f"\n⏱ 응답 시간: {elapsed:.2f}초")
-        # ⏱ print(f"📊 평균 응답 시간: {total_response_time / response_count:.2f}초\n")
-
-        if not unique_docs:
-            print("Bot:\n더 이상 새로운 정책을 찾지 못했어요. 다른 조건을 입력해 보실래요?\n")
+        missing_labels = [label for key, label in REQUIRED_LABELS if (key == "interests" and not stored_interests) or (key == "age" and stored_age is None) or (key == "region" and not stored_region)]
+        if missing_labels and not force_more_request:
+            pending_full_docs = []
+            pending_total = 0
+            prompt_required(missing_labels)
             continue
 
-        policy_ids = []
-        answers    = []
-        for doc in unique_docs:
-            pid = doc.metadata.get("policy_id", "")
-            pname = doc.metadata.get("title", "")
-            policy_ids.append(pid)
-            answers.append(f"{pname}에 지원할 수 있습니다.")
-            recommended_ids.add(pid)          # 기록
+        pending_full_docs = []
+        pending_total = 0
 
-        result_obj = {
-            "policy_id": policy_ids,
-            "answer": answers
-        }
-        print(json.dumps(result_obj, ensure_ascii=False, indent=2))
+        filters_keywords_only = {"categories": {"$in": stored_interests}} if stored_interests else None
 
-# ─────────────────────────────────── #
-# Helper: Fallback-based document retrieval
-# ─────────────────────────────────── #
+        base_prompt = "추천" if force_more_request else user_input
+        search_query = build_query(base_prompt, stored_age, stored_region, stored_interests)
+        extras = []
+        for extra_value in [stored_status, stored_income, stored_desired_job, stored_education, stored_special]:
+            if extra_value:
+                extras.append(extra_value)
+        if stored_hope_region and stored_hope_region != stored_region:
+            extras.append(stored_hope_region)
+        if extras:
+            search_query = f"{search_query} {' '.join(extras)}"
+
+        try:
+            if force_more_request:
+                raw_docs = vectordb.similarity_search(search_query, k=50)
+            else:
+                raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
+        except Exception:
+            raw_docs = vectordb.similarity_search(search_query, k=50)
+
+        filtered_docs = filter_docs(
+            raw_docs,
+            stored_age,
+            search_query,
+            stored_region if stored_region else "",
+            stored_interests,
+        )
+
+        candidate_docs = []
+        seen_ids = set()
+        for doc in filtered_docs:
+            pid = doc.metadata.get("policy_id")
+            if not pid or pid in recommended_ids or pid in seen_ids:
+                continue
+            candidate_docs.append(doc)
+            seen_ids.add(pid)
+
+        if not candidate_docs:
+            fallback_docs = vectordb.similarity_search("청년 정책 전국 공통", k=10)
+            candidate_docs = []
+            seen_ids = set()
+            for doc in fallback_docs:
+                pid = doc.metadata.get("policy_id")
+                if not pid or pid in recommended_ids or pid in seen_ids:
+                    continue
+                candidate_docs.append(doc)
+                seen_ids.add(pid)
+            if candidate_docs:
+                print("Bot:\\n조건에 딱 맞는 정책이 없어 전국 공통 정책을 먼저 살펴봤어요.")
+            else:
+                print("Bot:\\n조건에 맞는 정책을 찾지 못했어요. 나이, 지역, 관심 분야 외에 소득 분위나 희망 직무 등을 더 알려주시면 도움이 될 것 같아요!\\n")
+                continue
+
+        pending_full_docs = candidate_docs
+        pending_total = len(candidate_docs)
+
+        preview_count = min(len(candidate_docs), 3)
+        missing_optional = missing_optional_fields()
+        if pending_total == 1:
+            count_msg = "사용자님 조건에 맞는 정책이 1건 검색되었어요."
+        else:
+            count_msg = f"사용자님 조건에 맞는 정책이 {pending_total}건 검색되었어요."
+        confirm_msg = f" '네'라고 입력하시면 상위 {preview_count}건을 바로 안내드릴게요."
+        if missing_optional:
+            refine_msg = "더 세밀한 추천을 원하시면 " + ", ".join(missing_optional[:4])
+            if len(missing_optional) > 4:
+                refine_msg += " 등"
+            refine_msg += "의 정보를 알려주세요!"
+        else:
+            refine_msg = "추가로 궁금한 조건이 있다면 이어서 입력해 주세요!"
+        print(f"Bot:\\n{count_msg}{confirm_msg}\\n{refine_msg}\\n")
+
+
 def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
     filters = []
 
@@ -1267,6 +1487,17 @@ def generate_policy_response(
     prev_info             = session["user_info"] or {}
     prev_recommended_ids  = session["recommended_ids"]
 
+    optional_label_map = {
+        "income": "소득 분위",
+        "status": "고용 상태",
+        "education": "학력·전공",
+        "desired_job": "희망 직무",
+        "hope_region": "희망 근무 지역",
+        "family": "가족·부양 정보",
+        "special": "특별 대상 여부",
+        "gender": "성별",
+    }
+
     # 1) 새 입력에서 정보 추출
     current_info = extract_user_info(user_input)
 
@@ -1299,6 +1530,12 @@ def generate_policy_response(
         label_map = {"age": "나이", "region": "지역", "interests": "관심사"}
         missing_kor = [label_map[m] for m in missing]
         prompt_text = f"{', '.join(missing_kor)}를 알려주시면 맞춤형 정책을 추천해드릴게요."
+        optional_missing = [label for key, label in optional_label_map.items() if not user_info.get(key)]
+        if optional_missing:
+            prompt_text += f" 추가로 {', '.join(optional_missing[:4])}"
+            if len(optional_missing) > 4:
+                prompt_text += " 등"
+            prompt_text += " 세부 정보를 알려주시면 더 정밀한 추천이 가능해요."
         return {
             "message": prompt_text,
             "missing_info": missing,
@@ -1340,6 +1577,16 @@ def generate_policy_response(
 
     # 4) 벡터 검색 + 필터링 -------------------------------------------
     search_query = build_query(user_input, age, region, interests)
+    extras = []
+    for key in ["status", "income", "desired_job", "education", "special"]:
+        value = user_info.get(key)
+        if value:
+            extras.append(value)
+    hope_region = user_info.get("hope_region")
+    if hope_region and hope_region != region:
+        extras.append(hope_region)
+    if extras:
+        search_query = f"{search_query} {' '.join(extras)}"
     try:
         raw_docs = vectordb.similarity_search(search_query, k=50)
     except Exception:

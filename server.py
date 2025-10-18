@@ -14,4 +14,4 @@ from chatbot_v3 import generate_policy_response
 
 # print(generate_policy_response("kyle123", "나에게 맞는 정책 추천해줘"))
 # # → 바로 정책 추천 (누락 없음)
-print(generate_policy_response("kyle123", "서울에 사는 27세 청년이 받을 수 있는 지원금은?"))
+print(generate_policy_response("kyle123", "무주에 사는 23살이 받을 수 있는 취업 정책 추천해줘"))
