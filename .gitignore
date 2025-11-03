@@ -6,5 +6,4 @@ categorydb/
 __pycache__/
 /.AGENTS.md
 /check.md
-/프로젝트_현황_보고서.md
-/프로젝트_현황_보고서.docx
+.DS_Store
