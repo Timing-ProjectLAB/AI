@@ -5,7 +5,7 @@
 # 필요한 패키지: pip install langchain-openai langchain chromadb python-dotenv
 
 import os, re, json
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict, Any
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_community.vectorstores import Chroma
 from langchain.schema import Document
@@ -59,16 +59,22 @@ NON_POLICY_KEYWORDS = [
 # 간단한 휴리스틱과 키워드 리스트(NON_POLICY_KEYWORDS)를 기반으로, 입력이 정책 관련 질의인지 1차 검사하는 함수
 def is_policy_related_question(text: str) -> bool:
     import re
-    # uses global clean_text_for_matching and REVERSE_REGION_LOOKUP
-    if len(text.strip()) < 2:
+    cleaned_original = text.strip()
+    if not cleaned_original:
         return False
-    cleaned = re.sub(r"[ㅋㅎㅠㅜ]+", "", text.lower())
-    for word in NON_POLICY_KEYWORDS:
-        if word in cleaned:
-            return False
-    if re.match(r"^[가-힣]{1,3}(야|이야)?$", text.strip()):
+    cleaned = re.sub(r"[ㅋㅎㅠㅜ]+", "", cleaned_original.lower())
+    # 아주 짧은 인사말은 필터링
+    if len(cleaned) <= 6 and any(word in cleaned for word in NON_POLICY_KEYWORDS):
+        return False
+    if any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
+        return True
+    if "정책" in cleaned:
+        return True
+    if re.search(r"\d{1,2}\s*(세|살)", cleaned):
+        return True
+    if re.match(r"^[가-힣]{1,3}(야|이야)?$", cleaned_original):
         # Clean conversational endings like '야', '이야'
-        clean_key = clean_text_for_matching(text)
+        clean_key = clean_text_for_matching(cleaned_original)
         # If cleaned key matches a region in lookup, treat as policy-related (region input)
         if clean_key in REVERSE_REGION_LOOKUP:
             return True
@@ -89,9 +95,16 @@ def is_policy_related_question_llm(text: str) -> bool:
     cleaned = text.strip()
     if not cleaned:
         return False  # 빈 입력
+    # 휴리스틱으로 정책 가능성이 높으면 즉시 통과
+    if is_policy_related_question(text):
+        return True
 
     # '다른 정책', '추가 정책' 등 일반 추가 추천 요청은 정책 관련으로 간주
     if is_generic_more_request(cleaned):
+        return True
+    if any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
+        return True
+    if "희망" in cleaned and any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
         return True
 
     # ① 숫자 1~2자리만 입력 → 나이로 간주 → 정책 질문 True
@@ -126,6 +139,8 @@ def is_policy_related_question_llm(text: str) -> bool:
     system_msg = (
         "너는 대한민국 청년 정책 상담 챗봇의 분류기야. "
         "아래 사용자 입력이 정책과 *관련된 질문*인지 판단해. "
+        "사용자가 나이·지역·관심사·희망 직무 등 정책 상담으로 이어질 정보를 말하면 'Y'를 선택해. "
+        "정책과 전혀 무관한 잡담/인사/욕설일 때만 'N'을 선택해. "
         "대답은 'Y' 또는 'N' 중 하나로만."
     )
     user_msg = f"사용자 입력: {cleaned}\n\n정책 관련 질문인가?"
@@ -141,10 +156,16 @@ def is_policy_related_question_llm(text: str) -> bool:
             max_tokens=1,
         )
         content = resp.choices[0].message.content if resp.choices else ""
-        return (content or "").strip().upper().startswith("Y")
+        verdict = (content or "").strip().upper()
+        if verdict.startswith("Y"):
+            return True
+        if verdict.startswith("N"):
+            return False
+        # 애매하면 정책 질의로 간주
+        return True
     except Exception:
         # 네트워크/쿼터 문제 시 휴리스틱으로 폴백
-        return is_policy_related_question(cleaned)
+        return is_policy_related_question(text)
 
 # 토큰 수나 핵심 키워드 포함 여부를 보고 “유효한 정책 질의”인지 추가 검사하는 함수
 def is_valid_query(text: str) -> bool:
@@ -237,8 +258,7 @@ def extract_user_info(user_input: str):
         info["education"] = "재학 중"
 
     # 희망 직무
-    desired_jobs = ["개발자", "디자이너", "간호사", "엔지니어", "교사", "연구원", "마케터", "공무원", "데이터 분석가"]
-    for job in desired_jobs:
+    for job in DESIRED_JOB_KEYWORDS:
         if job in user_input:
             info["desired_job"] = job
             break
@@ -322,7 +342,7 @@ INTEREST_MAPPING = {
     "장학금": ["장학금", "학비 지원", "등록금 지원", "교육비 지원", "학자금"],
     "해외연수": ["해외연수", "글로벌 연수", "교환학생", "어학연수", "해외교육"],
     "인턴십": ["인턴십", "현장실습", "산학협력", "인턴", "실무경험"],
-    "주거": ["주거", "주택", "임대", "전세", "월세", "보증금", "부동산"],
+    "주거": ["주거", "주택", "임대", "전세", "월세", "보증금", "부동산", "자취", "독립", "원룸"],
     "복지": ["복지", "사회복지", "지원", "보조금", "바우처", "의료", "건강", "출산", "육아"],
     "참여": ["참여", "권리", "시민", "사회", "봉사", "활동", "동아리"],
     "직업교육": ["직업", "훈련", "기술", "자격증", "교육", "강좌", "직업훈련"],
@@ -330,6 +350,11 @@ INTEREST_MAPPING = {
     "정신건강": ["정신건강", "상담", "심리", "스트레스", "우울증"],
     "금융지원": ["대출", "자금", "지원금", "보조금", "융자"]
 }
+
+DESIRED_JOB_KEYWORDS = [
+    "개발자", "디자이너", "간호사", "엔지니어", "교사",
+    "연구원", "마케터", "공무원", "데이터 분석가"
+]
 REGION_KEYWORDS = {
     "서울": ["서울", "서울시"],
     "경기": ["경기", "경기도"],
@@ -796,6 +821,146 @@ def classify_user_type(text: str) -> str:
     return "policy_expert" if any(kw in text for kw in known) else "policy_novice"
 # ─────────────────────────────────── #
 
+
+def compose_missing_info_message(
+    user_input: str,
+    user_info: Dict[str, Any],
+    missing_keys: List[str],
+    optional_label_map: Dict[str, str],
+) -> str:
+    """
+    LLM을 사용해 부족한 필수 정보를 자연스럽게 요청하는 문장을 생성한다.
+    """
+    label_map = {"age": "나이", "region": "지역", "interests": "관심사"}
+    missing_labels = [label_map.get(key, key) for key in missing_keys]
+    optional_missing = [
+        label for key, label in optional_label_map.items() if not user_info.get(key)
+    ]
+
+    known_map = {**label_map, **optional_label_map}
+    known_chunks: List[str] = []
+    for key, label in known_map.items():
+        value = user_info.get(key)
+        if not value:
+            continue
+        if isinstance(value, list):
+            value = ", ".join(str(v) for v in value if v)
+        if value:
+            known_chunks.append(f"{label}: {value}")
+
+    system_prompt = (
+        "너는 대한민국 청년 정책 챗봇의 문장 보조자다. "
+        "부족한 필수 정보를 정중하고 친근하게 요청하는 1~2문장을 작성하라. "
+        "필수 항목은 자연스럽게 언급하고, 이미 확보한 정보는 중복 없이 간단히 인정한다. "
+        "한국어로 답하고 기계적인 표현은 피한다."
+    )
+    user_prompt = (
+        f"사용자 최신 입력: {user_input}\n"
+        f"필수로 더 필요한 항목: {', '.join(missing_labels)}\n"
+        f"현재까지 파악된 정보: {', '.join(known_chunks) if known_chunks else '없음'}\n"
+        f"선택적으로 부탁할 수 있는 항목: {', '.join(optional_missing) if optional_missing else '없음'}\n\n"
+        "요구사항:\n"
+        "1. 부족한 필수 정보를 명확히 요청할 것.\n"
+        "2. 이미 확보한 정보가 있다면 한 번만 가볍게 인정할 것.\n"
+        "3. 문장은 최대 두 개, 한국어.\n"
+        "4. 같은 표현을 반복하지 말 것.\n"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=120,
+        )
+        content = response.choices[0].message.content if response.choices else ""
+        if content:
+            return content.strip()
+    except Exception:
+        pass
+
+    fallback = f"{', '.join(missing_labels)}를 알려주시면 맞춤형 정책을 추천해드릴게요."
+    if optional_missing:
+        fallback += f" 추가로 {', '.join(optional_missing[:4])}"
+        if len(optional_missing) > 4:
+            fallback += " 등"
+        fallback += " 세부 정보를 알려주시면 더 정밀한 추천이 가능해요."
+    return fallback
+
+
+def compose_followup_prompt(
+    profile: Dict[str, Any],
+    optional_missing: List[str],
+    recommended_titles: List[str],
+    fallback_used: bool,
+    last_user_message: str,
+) -> str:
+    """
+    정책 추천 이후 자연스러운 후속 질문을 생성한다.
+    """
+    age = profile.get("age")
+    region = profile.get("region")
+    interests = profile.get("interests") or []
+    desired_job = profile.get("desired_job")
+
+    profile_parts = []
+    if age:
+        profile_parts.append(f"나이 {age}세")
+    if region:
+        profile_parts.append(f"{region} 거주")
+    if interests:
+        profile_parts.append("관심사 " + ", ".join(interests))
+    if desired_job:
+        profile_parts.append(f"희망 직무 {desired_job}")
+
+    system_prompt = (
+        "너는 대한민국 청년 정책 챗봇의 대화 보조자다. "
+        "방금 추천한 정책을 본 사용자가 자연스럽게 이어서 이야기하도록, 1~2문장으로 질문을 생성해라. "
+        "마지막 문장은 꼭 질문부호(?)로 끝나야 한다. "
+        "사용자가 방금 준 정보와 추천 정책을 간단히 인정하되, 동일 문장을 반복하지 말고 실제 상담처럼 자연스럽게 이어가라. "
+        "추가 정보가 필요하다고 판단되면 왜 필요한지 짧게 언급하며 부드럽게 요청해라. "
+        "전국 공통 정책만 보여준 경우(fallback_used=True)에는 그 사실을 한 번 짚고, 조건을 좁히기 위한 제안을 섞어라. "
+        "푸시형 안내를 피하고, 사용자의 관심사나 희망 직무를 바탕으로 더 알고 싶은 세부 조건을 센스 있게 묻는다."
+    )
+
+    user_prompt = (
+        f"사용자 프로필 요약: {', '.join(profile_parts) if profile_parts else '미확보'}\n"
+        f"추천 정책명: {', '.join(recommended_titles) if recommended_titles else '없음'}\n"
+        f"아직 확인되지 않은 정보 목록: {', '.join(optional_missing) if optional_missing else '없음'}\n"
+        f"전국 공통 정책 안내 여부(fallback_used): {fallback_used}\n"
+        f"사용자 직전 발화: {last_user_message}\n"
+        "대답 지침:\n"
+        "1. 1~2문장, 마지막은 질문. 질문은 의미 있는 후속 대화를 이끌어야 한다.\n"
+        "2. 사용자가 방금 말한 조건을 긍정하고, 그에 맞는 다음 관심사를 제시한다.\n"
+        "3. '아직 확인되지 않은 정보 목록'은 참고용일 뿐이며, 꼭 물어볼 필요는 없다.\n"
+        "4. 추가 질문이 반복되지 않도록, 직전 발화와 다른 관점에서 묻는다.\n"
+    )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.4,
+            max_tokens=120,
+        )
+        content = response.choices[0].message.content if response.choices else ""
+        if content:
+            return content.strip()
+    except Exception:
+        pass
+
+    if fallback_used:
+        return "전국 공통 정책부터 소개해 드렸는데, 관심 있는 산업이나 준비 중인 분야가 있을까요?"
+    if optional_missing:
+        return f"추천드린 정책은 어떠셨나요? 추가로 {optional_missing[0]} 쪽도 궁금하신 부분이 있을까요?"
+    return "추천드린 정책 중 더 깊게 살펴보고 싶은 부분이 있으신가요?"
+
 # ─────────────────────────────────── #
 # 5. 시스템 프롬프트
 # ─────────────────────────────────── #
@@ -1241,12 +1406,29 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             print("Bot: 이용해 주셔서 감사합니다. 안녕히 가세요!")
             break
 
+        profile_after_input = apply_user_text(user_input)
+
         force_more_request = is_generic_more_request(user_input)
         if not force_more_request and not is_policy_related_question_llm(user_input):
-            print("Bot:\\n저는 대한민국 청년 정책 안내를 도와드리는 챗봇이에요! 정책 관련 질문을 해주세요 😊\\n")
-            continue
+            missing_required_keys = []
+            if profile_after_input.get("age") is None:
+                missing_required_keys.append("age")
+            if profile_after_input.get("region") is None:
+                missing_required_keys.append("region")
+            if not profile_after_input.get("interests"):
+                missing_required_keys.append("interests")
 
-        apply_user_text(user_input)
+            if missing_required_keys:
+                message = compose_missing_info_message(
+                    user_input,
+                    profile_after_input,
+                    missing_required_keys,
+                    OPTIONAL_FIELD_LABELS,
+                )
+            else:
+                message = "정책과 관련된 궁금한 점을 알려주시면 맞춤형으로 찾아드릴게요!"
+            print(f"Bot:\\n{message}\\n")
+            continue
 
         predicted_keywords = None
         embedding_model = None
@@ -1353,6 +1535,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             candidate_docs.append(doc)
             seen_ids.add(pid)
 
+        fallback_used = False
         if not candidate_docs:
             fallback_docs = vectordb.similarity_search("청년 정책 전국 공통", k=10)
             candidate_docs = []
@@ -1364,6 +1547,7 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 candidate_docs.append(doc)
                 seen_ids.add(pid)
             if candidate_docs:
+                fallback_used = True
                 print("Bot:\\n조건에 딱 맞는 정책이 없어 전국 공통 정책을 먼저 살펴봤어요.")
             else:
                 print("Bot:\\n조건에 맞는 정책을 찾지 못했어요. 나이, 지역, 관심 분야 외에 소득 분위나 희망 직무 등을 더 알려주시면 도움이 될 것 같아요!\\n")
@@ -1373,20 +1557,21 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         pending_total = len(candidate_docs)
 
         preview_count = min(len(candidate_docs), 3)
+        display_policies(candidate_docs, limit=preview_count)
+
         missing_optional = missing_optional_fields()
-        if pending_total == 1:
-            count_msg = "사용자님 조건에 맞는 정책이 1건 검색되었어요."
-        else:
-            count_msg = f"사용자님 조건에 맞는 정책이 {pending_total}건 검색되었어요."
-        confirm_msg = f" '네'라고 입력하시면 상위 {preview_count}건을 바로 안내드릴게요."
-        if missing_optional:
-            refine_msg = "더 세밀한 추천을 원하시면 " + ", ".join(missing_optional[:4])
-            if len(missing_optional) > 4:
-                refine_msg += " 등"
-            refine_msg += "의 정보를 알려주세요!"
-        else:
-            refine_msg = "추가로 궁금한 조건이 있다면 이어서 입력해 주세요!"
-        print(f"Bot:\\n{count_msg}{confirm_msg}\\n{refine_msg}\\n")
+        recommended_titles = [
+            doc.metadata.get("title", "") for doc in candidate_docs[:preview_count]
+        ]
+        followup_message = compose_followup_prompt(
+            current_profile(),
+            missing_optional,
+            [title for title in recommended_titles if title],
+            fallback_used,
+            user_input,
+        )
+        if followup_message:
+            print(f"Bot:\\n{followup_message}\\n")
 
 
 def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
@@ -1527,17 +1712,9 @@ def generate_policy_response(
         missing.append("interests")
 
     if missing:
-        label_map = {"age": "나이", "region": "지역", "interests": "관심사"}
-        missing_kor = [label_map[m] for m in missing]
-        prompt_text = f"{', '.join(missing_kor)}를 알려주시면 맞춤형 정책을 추천해드릴게요."
-        optional_missing = [label for key, label in optional_label_map.items() if not user_info.get(key)]
-        if optional_missing:
-            prompt_text += f" 추가로 {', '.join(optional_missing[:4])}"
-            if len(optional_missing) > 4:
-                prompt_text += " 등"
-            prompt_text += " 세부 정보를 알려주시면 더 정밀한 추천이 가능해요."
+        message = compose_missing_info_message(user_input, user_info, missing, optional_label_map)
         return {
-            "message": prompt_text,
+            "message": message,
             "missing_info": missing,
         }
 
