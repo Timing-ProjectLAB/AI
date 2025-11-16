@@ -66,8 +66,6 @@ def is_policy_related_question(text: str) -> bool:
     # 아주 짧은 인사말은 필터링
     if len(cleaned) <= 6 and any(word in cleaned for word in NON_POLICY_KEYWORDS):
         return False
-    if any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
-        return True
     if "정책" in cleaned:
         return True
     if re.search(r"\d{1,2}\s*(세|살)", cleaned):
@@ -101,10 +99,6 @@ def is_policy_related_question_llm(text: str) -> bool:
 
     # '다른 정책', '추가 정책' 등 일반 추가 추천 요청은 정책 관련으로 간주
     if is_generic_more_request(cleaned):
-        return True
-    if any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
-        return True
-    if "희망" in cleaned and any(job in cleaned for job in DESIRED_JOB_KEYWORDS):
         return True
 
     # ① 숫자 1~2자리만 입력 → 나이로 간주 → 정책 질문 True
@@ -219,6 +213,10 @@ def extract_user_info(user_input: str):
     info["age"] = parsed_age
     info["region"] = parsed_region
     info["interests"] = parsed_interests if parsed_interests else []
+    if info["age"] is None:
+        m_age = re.search(r"(?:만\s*)?(\d{1,2})\s*(?:세|살)", user_input)
+        if m_age:
+            info["age"] = int(m_age.group(1))
 
     # 상태 추출
     if "대학생" in user_input:
@@ -258,11 +256,10 @@ def extract_user_info(user_input: str):
         info["education"] = "재학 중"
 
     # 희망 직무
-    for job in DESIRED_JOB_KEYWORDS:
-        if job in user_input:
-            info["desired_job"] = job
-            break
-
+    if not info["desired_job"]:
+        inferred_job = infer_desired_job_with_llm(user_input)
+        if inferred_job:
+            info["desired_job"] = inferred_job
     # 희망 근무 지역
     if any(keyword in user_input for keyword in ["근무", "일하고", "취업", "취직", "일자리"]):
         hoped_region = extract_region(user_input, REGION_MAPPING)
@@ -312,8 +309,15 @@ embedding = OpenAIEmbeddings()
 # Load keyword vectorstore (ensure it's built with keyword terms only)
 keyword_vectordb = Chroma(persist_directory="./kwdb", embedding_function=embedding)
 category_vectordb = Chroma(persist_directory="./categorydb", embedding_function=embedding)
-# Main policy vectorstore
-policy_vectordb = Chroma(persist_directory="./chroma_policies", embedding_function=embedding)
+# Main policy vectorstore (lazy init to avoid locking during rebuilds)
+policy_vectordb: Optional[Chroma] = None
+
+
+def get_policy_vectordb() -> Chroma:
+    global policy_vectordb
+    if policy_vectordb is None:
+        policy_vectordb = Chroma(persist_directory="./chroma_policies", embedding_function=embedding)
+    return policy_vectordb
 # 0. 보조 함수 – 질의 재구성
 # ─────────────────────────────────── #
 
@@ -330,6 +334,144 @@ def build_query(base_prompt: str,
     if interests:
         parts.append(f"관심사 {', '.join(interests)}")
     return " ".join(parts)
+
+
+def build_category_filter(interests: Optional[List[str]]) -> Optional[Dict[str, Any]]:
+    """
+    관심사 목록을 기반으로 category_tokens 메타데이터 필터 생성.
+    여러 관심사가 있으면 OR 조건으로 완화한다.
+    """
+    if not interests:
+        return None
+
+    clauses = []
+    for interest in interests:
+        normalized = (interest or "").strip()
+        if not normalized:
+            continue
+        clauses.append({"category_tokens": {"$contains": f"|{normalized}|"}})
+
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
+def merge_filters(*filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    다수의 where 필터를 AND로 묶어준다. None은 무시.
+    """
+    active = [f for f in filters if f]
+    if not active:
+        return {}
+    if len(active) == 1:
+        return active[0]
+    return {"$and": active}
+
+
+def augment_interests_with_job(interests: List[str], desired_job: Optional[str]) -> List[str]:
+    """
+    희망 직무와 연관된 키워드들을 관심사에 일시적으로 추가하여 검색/필터링에 활용.
+    """
+    augmented = list(interests or [])
+    if not desired_job:
+        return augmented
+
+    normalized = desired_job.strip()
+    if not normalized:
+        return augmented
+
+    if normalized not in augmented:
+        augmented.append(normalized)
+
+    return augmented
+
+
+RELAXED_REGION_LABELS = {"no_region", "no_region_job", "age_only", "category_only", "unfiltered", "fallback"}
+
+
+def build_filter_sequence(
+    age: Optional[int],
+    region: Optional[str],
+    interests: Optional[List[str]],
+    desired_job: Optional[str],
+) -> List[Tuple[Dict[str, Any], str, bool]]:
+    """
+    지역/나이/관심사/희망 직무를 조합한 필터 시퀀스를 생성.
+    반환 값: (filter_dict, label, job_enforced) 리스트
+    """
+    sequences: List[Tuple[Dict[str, Any], str, bool]] = []
+    category_filter = build_category_filter(interests)
+    job_filter = build_job_filter(desired_job)
+
+    def add_filter(label: str, use_region: bool, use_age: bool, include_category: bool = True, include_job: bool = False):
+        meta: Dict[str, Any] = {}
+        if use_region and region:
+            meta["region"] = {"$contains": region}
+        if use_age and age:
+            meta["min_age"] = {"$lte": age}
+            meta["max_age"] = {"$gte": age}
+        job_component = job_filter if include_job and job_filter else None
+        filt = merge_filters(meta or None, category_filter if include_category else None, job_component)
+        if filt:
+            sequences.append((filt, label, bool(job_component)))
+
+    if job_filter:
+        add_filter("full", True, True, True, True)
+    add_filter("full", True, True, True, False)
+    if job_filter:
+        add_filter("no_region_job", False, True, True, True)
+    add_filter("no_region", False, True, True, False)
+    if job_filter:
+        add_filter("no_age_job", True, False, True, True)
+    add_filter("no_age", True, False, True, False)
+    add_filter("region_age_only", True, True, False, False)
+    add_filter("age_only", False, True, False, False)
+    add_filter("region_only", True, False, False, False)
+
+    if category_filter:
+        sequences.append((category_filter, "category_only", False))
+
+    return sequences
+
+
+def adaptive_similarity_search(
+    vectordb: Chroma,
+    query: str,
+    filters: List[Tuple[Dict[str, Any], str, bool]],
+    *,
+    fallback_query: Optional[str] = None,
+    k: int = 50,
+) -> Tuple[List[Document], str, bool]:
+    """
+    필터 시퀀스를 순회하며 검색. 결과가 나오면 즉시 반환하고, 마지막엔 일반 검색 수행.
+    반환값: (문서 리스트, 필터 레이블, job_enforced)
+    """
+    for filt, label, job_enforced in filters:
+        try:
+            docs = vectordb.similarity_search(query, k=k, filter=filt)
+        except Exception:
+            docs = []
+        if docs:
+            return docs, label, job_enforced
+
+    try:
+        docs = vectordb.similarity_search(query, k=k)
+        if docs:
+            return docs, "unfiltered", False
+    except Exception:
+        docs = []
+
+    if fallback_query and fallback_query != query:
+        try:
+            docs = vectordb.similarity_search(fallback_query, k=k)
+            if docs:
+                return docs, "fallback", False
+        except Exception:
+            pass
+
+    return [], "none", False
 # ─────────────────────────────────── #
 # 1. 관심사 · 지역 맵
 # ─────────────────────────────────── #
@@ -351,10 +493,62 @@ INTEREST_MAPPING = {
     "금융지원": ["대출", "자금", "지원금", "보조금", "융자"]
 }
 
-DESIRED_JOB_KEYWORDS = [
-    "개발자", "디자이너", "간호사", "엔지니어", "교사",
-    "연구원", "마케터", "공무원", "데이터 분석가"
-]
+JOB_TOKEN_HINTS = {}
+
+
+def build_job_filter(desired_job: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not desired_job:
+        return None
+    normalized = desired_job.strip()
+    if not normalized:
+        return None
+    tokens = [
+        normalized,
+        normalized.replace(" ", ""),
+        normalized.lower(),
+    ]
+    clauses = [{"keywords": {"$contains": token}} for token in tokens if token]
+    text_clause = {"$contains": normalized}
+    if clauses:
+        clauses.append(text_clause)
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$or": clauses}
+    return None
+
+
+def infer_desired_job_with_llm(user_input: str) -> Optional[str]:
+    """
+    LLM을 사용해 사용자의 문장에서 희망 직무를 자유롭게 추론.
+    """
+    system_prompt = (
+        "너는 청년 정책 상담 챗봇의 분석가야. "
+        "사용자 발화에서 희망 직무나 관심 직무를 1~3단어의 한국어 또는 영어 표현으로 요약해. "
+        "명확한 언급이 없으면 '없음'이라고 답해."
+    )
+    user_prompt = (
+        f"사용자 발화: {user_input}\n"
+        "희망 직무를 짧게 요약해서 답하거나 없으면 '없음'이라고 답하세요."
+    )
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            max_tokens=8,
+            temperature=0,
+        )
+        content = resp.choices[0].message.content.strip() if resp.choices else ""
+        if not content:
+            return None
+        answer = content.strip().strip(".")
+        if answer == "없음":
+            return None
+        return answer
+    except Exception:
+        return None
 REGION_KEYWORDS = {
     "서울": ["서울", "서울시"],
     "경기": ["경기", "경기도"],
@@ -634,17 +828,52 @@ def extract_categories(cat_field: str) -> List[str]:
         return []
     return [c.strip() for c in cat_field.split(",") if c.strip()]
 
+
+def build_category_tokens(categories: List[str]) -> str:
+    """
+    카테고리 문자열을 바탕으로 필터에 사용할 토큰 문자열 생성.
+    '|토큰|' 형태로 래핑해 부분 문자열 검색 시 정확도가 높도록 함.
+    """
+    if not categories:
+        return ""
+
+    tokens = set()
+    for cat in categories:
+        clean = cat.strip()
+        if not clean:
+            continue
+        tokens.add(clean)
+        tokens.add(clean.replace(" ", ""))
+
+        # 관심사 키워드 매핑 결과도 함께 추가
+        for interest, keywords in INTEREST_MAPPING.items():
+            if interest in clean or any(keyword in clean for keyword in keywords):
+                tokens.add(interest)
+
+        # 한글/영문 단어 단위로도 토큰화
+        for word in re.findall(r"[가-힣A-Za-z]{2,}", clean):
+            tokens.add(word)
+
+    if not tokens:
+        return ""
+
+    sorted_tokens = sorted(tokens)
+    return "|" + "|".join(sorted_tokens) + "|"
+
 # ─────────────────────────────────── #
 # 3. 벡터스토어 로드/생성 (강화 버전)
 # ─────────────────────────────────── #
 def load_or_build_vectorstore(json_path: str,
                               persist_dir: str,
                               api_key: str) -> Chroma:
+    global policy_vectordb
     os.environ["OPENAI_API_KEY"] = api_key
     embedding = OpenAIEmbeddings()
 
     if os.path.exists(persist_dir) and os.listdir(persist_dir):
-        return Chroma(persist_directory=persist_dir, embedding_function=embedding)
+        existing = Chroma(persist_directory=persist_dir, embedding_function=embedding)
+        policy_vectordb = existing
+        return existing
 
     with open(json_path, encoding="utf-8") as f:
         policies = json.load(f)
@@ -675,11 +904,13 @@ def load_or_build_vectorstore(json_path: str,
         if isinstance(existing_keywords, str):
             existing_keywords = [kw.strip() for kw in existing_keywords.split(",") if kw.strip()]
         merged_keywords = list(set(existing_keywords + extract_keywords(text)))
+        category_list = extract_categories(p.get('category', ''))
         metadata = {
             "policy_id":        p.get("policy_id"),
             "title":            p["title"],
             "region":           ", ".join(p.get("region_name", [])),
-            "categories":       ", ".join(extract_categories(p.get('category', ''))),
+            "categories":       ", ".join(category_list),
+            "category_tokens":  build_category_tokens(category_list),
             "keywords":         ", ".join(merged_keywords),
             "min_age":          safe_int(p.get("min_age")),
             "max_age":          safe_int(p.get("max_age"), 99),
@@ -699,6 +930,7 @@ def load_or_build_vectorstore(json_path: str,
         vectordb.add_documents(documents)
 
     vectordb.persist()
+    policy_vectordb = vectordb
     return vectordb
 
 # ─────────────────────────────────── #
@@ -1044,17 +1276,29 @@ def jaccard_similarity(a: set, b: set) -> float:
     return len(a & b) / len(a | b)
 
 
-def filter_docs(docs,user_age: Optional[int], user_text: str, region: str, interests: List[str]):
+def filter_docs(
+    docs,
+    user_age: Optional[int],
+    user_text: str,
+    region: str,
+    interests: List[str],
+    *,
+    allow_region_mismatch: bool = False,
+    desired_job: Optional[str] = None,
+    require_job_match: bool = False,
+):
     """
     docs        : LangChain Document 리스트
     user_age    : 나이 조건
     user_text   : 사용자가 입력한 원문
     region      : 파싱된 표준 지역(예: '서울')
     interests   : 파싱된 관심사 리스트(예: ['창업', '주거'])
+    desired_job : 희망 직무
     """
     filtered = []
     kw_hits = extract_keywords(user_text)          # 사용자 문장에서 추출된 키워드 집합
     interests_set = set(interests)
+    job_query = desired_job.strip() if desired_job else ""
 
     for d in docs:
         # ─────────────────────── #
@@ -1079,6 +1323,10 @@ def filter_docs(docs,user_age: Optional[int], user_text: str, region: str, inter
             region_score = 0.5
         else:
             region_score = 0.0
+        region_mismatch = bool(region) and not is_nationwide and region_score == 0.0
+        d.metadata["region_mismatch"] = region_mismatch
+        if region_mismatch and not allow_region_mismatch:
+            continue
 
         # ─────────────────────── #
         # 2. 관심사 점수 (I: 0~1)
@@ -1113,7 +1361,28 @@ def filter_docs(docs,user_age: Optional[int], user_text: str, region: str, inter
             keyword_score = 0.0
 
         # ─────────────────────── #
-        # 4. 최종 점수 (동적 가중치)
+        # 4. 희망 직무 매칭 여부
+        # ─────────────────────── #
+        job_matched = True
+        if job_query:
+            key_raw = d.metadata.get("keywords", [])
+            if isinstance(key_raw, str):
+                key_tokens = [k.strip() for k in re.split(r"[,\[\]'\"\s]+", key_raw) if k.strip()]
+            else:
+                key_tokens = key_raw
+            doc_keyword_set = set(key_tokens)
+            job_matched = any(job_query in token for token in doc_keyword_set)
+            if not job_matched:
+                lowered = d.page_content.lower()
+                job_matched = job_query.lower() in lowered
+            d.metadata["job_mismatch"] = not job_matched
+            if require_job_match and not job_matched:
+                continue
+        else:
+            d.metadata["job_mismatch"] = False
+
+        # ─────────────────────── #
+        # 5. 최종 점수 (동적 가중치)
         # ─────────────────────── #
         total_w = 0
         score_sum = 0
@@ -1222,8 +1491,10 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
     recommended_ids = set()
     pending_full_docs = []
     pending_total = 0
+    last_region_relaxed = False
+    last_job_relaxed = False
 
-    vectordb = policy_vectordb if policy_vectordb is not None else globals().get("policy_vectordb")
+    vectordb = policy_vectordb if policy_vectordb is not None else get_policy_vectordb()
     if vectordb is None:
         print("Bot: 정책 데이터베이스를 찾지 못했습니다. 벡터스토어를 먼저 빌드해 주세요.")
         return
@@ -1350,11 +1621,23 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
 
     def display_policies(docs: list, limit: int = 10):
         nonlocal recommended_ids
+        nonlocal last_region_relaxed, last_job_relaxed
         profile = current_profile()
+        summary_line = summarize_profile_for_message(profile)
         if not docs:
-            print("Bot:\\n표시할 정책이 없어요. 다른 조건을 알려주세요!\\n")
+            no_result = "표시할 정책이 없어요. 다른 조건을 알려주세요!"
+            if summary_line:
+                no_result = f"{summary_line}에 맞는 정책을 찾지 못했어요. 다른 조건을 알려주세요!"
+            print(f"Bot:\\n{no_result}\\n")
             return
-        print("Bot:\\n맞춤 정책을 안내드릴게요!")
+        header = "맞춤 정책을 안내드릴게요!"
+        if summary_line:
+            header = f"{summary_line} 기준으로 맞춤 정책을 안내드릴게요!"
+        print(f"Bot:\\n{header}")
+        if last_region_relaxed and profile.get("region"):
+            print("※ 지역 조건을 완화해 비슷한 지역 정책도 포함했어요.")
+        if last_job_relaxed and profile.get("desired_job"):
+            print("※ 희망 직무에 딱 맞는 정책이 부족해 일반 취업 정책도 함께 보여드려요.")
         for idx, doc in enumerate(docs[:limit], 1):
             pid = doc.metadata.get("policy_id", "")
             title = doc.metadata.get("title", "알 수 없는 정책")
@@ -1373,6 +1656,10 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
                 print(f"   신청 링크: {apply_url}")
             if reason:
                 print(f"   추천 이유: {reason}")
+            if profile.get("region") and doc.metadata.get("region_mismatch"):
+                print("   ※ 사용자의 지역과 다른 지역 정책이지만 유사 조건으로 추천했어요.")
+            if profile.get("desired_job") and doc.metadata.get("job_mismatch"):
+                print("   ※ 희망 직무와 직접 관련된 내용은 없지만 참고용으로 안내드려요.")
             if pid:
                 recommended_ids.add(pid)
         if len(docs) > limit:
@@ -1497,10 +1784,9 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         pending_full_docs = []
         pending_total = 0
 
-        filters_keywords_only = {"categories": {"$in": stored_interests}} if stored_interests else None
-
         base_prompt = "추천" if force_more_request else user_input
-        search_query = build_query(base_prompt, stored_age, stored_region, stored_interests)
+        augmented_interests = augment_interests_with_job(stored_interests, stored_desired_job)
+        search_query = build_query(base_prompt, stored_age, stored_region, augmented_interests)
         extras = []
         for extra_value in [stored_status, stored_income, stored_desired_job, stored_education, stored_special]:
             if extra_value:
@@ -1510,20 +1796,29 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         if extras:
             search_query = f"{search_query} {' '.join(extras)}"
 
-        try:
-            if force_more_request:
-                raw_docs = vectordb.similarity_search(search_query, k=50)
-            else:
-                raw_docs = vectordb.similarity_search(search_query, k=50, filter=filters_keywords_only)
-        except Exception:
-            raw_docs = vectordb.similarity_search(search_query, k=50)
+        filter_sequence = build_filter_sequence(stored_age, stored_region, augmented_interests, stored_desired_job)
+        raw_docs, filter_label, job_enforced = adaptive_similarity_search(
+            vectordb,
+            search_query,
+            filter_sequence,
+            fallback_query=user_input,
+            k=50,
+        )
+        job_filter_active = bool(stored_desired_job)
+        job_relaxed = job_filter_active and not job_enforced
+        region_relaxed = bool(stored_region and filter_label in RELAXED_REGION_LABELS)
+        last_region_relaxed = region_relaxed
+        last_job_relaxed = job_relaxed
 
         filtered_docs = filter_docs(
             raw_docs,
             stored_age,
-            search_query,
+            user_input,
             stored_region if stored_region else "",
-            stored_interests,
+            augmented_interests,
+            allow_region_mismatch=region_relaxed,
+            desired_job=stored_desired_job,
+            require_job_match=job_filter_active and not job_relaxed,
         )
 
         candidate_docs = []
@@ -1535,23 +1830,17 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
             candidate_docs.append(doc)
             seen_ids.add(pid)
 
-        fallback_used = False
+        fallback_used = (filter_label != "full") or job_relaxed
         if not candidate_docs:
-            fallback_docs = vectordb.similarity_search("청년 정책 전국 공통", k=10)
-            candidate_docs = []
-            seen_ids = set()
-            for doc in fallback_docs:
-                pid = doc.metadata.get("policy_id")
-                if not pid or pid in recommended_ids or pid in seen_ids:
-                    continue
-                candidate_docs.append(doc)
-                seen_ids.add(pid)
-            if candidate_docs:
-                fallback_used = True
-                print("Bot:\\n조건에 딱 맞는 정책이 없어 전국 공통 정책을 먼저 살펴봤어요.")
-            else:
-                print("Bot:\\n조건에 맞는 정책을 찾지 못했어요. 나이, 지역, 관심 분야 외에 소득 분위나 희망 직무 등을 더 알려주시면 도움이 될 것 같아요!\\n")
-                continue
+            profile_summary = summarize_profile_for_message(current_profile())
+            no_policy_msg = "조건에 맞는 정책을 찾지 못했어요."
+            if profile_summary:
+                no_policy_msg = f"{profile_summary}에 맞는 정책을 찾지 못했어요."
+            advice = "나이·지역·관심 분야 외에 소득 분위나 희망 직무 등을 더 알려주시면 도움이 될 것 같아요!"
+            print(f"Bot:\\n{no_policy_msg} {advice}\\n")
+            pending_full_docs = []
+            pending_total = 0
+            continue
 
         pending_full_docs = candidate_docs
         pending_total = len(candidate_docs)
@@ -1572,46 +1861,6 @@ def console_chat(rag_chain, llm, keyword_vectordb=None, category_vectordb=None, 
         )
         if followup_message:
             print(f"Bot:\\n{followup_message}\\n")
-
-
-def retrieve_with_fallback(query, age, region, interests, vectordb, k=5):
-    filters = []
-
-    meta = {}
-    if region:
-        meta["region"] = {"$contains": region}
-    if age:
-        meta["min_age"] = {"$lte": age}
-        meta["max_age"] = {"$gte": age}
-    if interests:
-        meta["categories"] = {"$in": interests}
-    filters.append(meta)
-
-    if "region" in meta:
-        f2 = meta.copy()
-        del f2["region"]
-        filters.append(f2)
-
-    if "min_age" in meta and "max_age" in meta:
-        f3 = meta.copy()
-        del f3["min_age"]
-        del f3["max_age"]
-        filters.append(f3)
-
-    if "categories" in meta:
-        filters.append({"categories": {"$in": interests}})
-
-    filters.append({})  # no filters
-
-    for f in filters:
-        try:
-            docs = vectordb.similarity_search(query, filter=f, k=k)
-            if docs:
-                return docs
-        except Exception as e:
-            continue
-
-    return []
 
 
 # ─────────────────────────────────── #
@@ -1651,11 +1900,50 @@ def _compose_reason(doc: Document, user_info: Dict) -> str:
 
     return ", ".join(reasons) if reasons else "일부 조건 부합"
 
+
+def summarize_profile_for_message(profile: Dict[str, Any]) -> str:
+    """
+    대화 출력이나 API 응답에서 사용할 사용자 정보 요약 문자열.
+    """
+    if not profile:
+        return ""
+
+    parts = []
+    age = profile.get("age")
+    region = profile.get("region")
+    interests = profile.get("interests") or []
+
+    if age:
+        parts.append(f"{age}세")
+    if region:
+        parts.append(region)
+    if interests:
+        preview = ", ".join(str(i) for i in interests[:3] if i)
+        if preview:
+            if len(interests) > 3:
+                preview = f"{preview} 등"
+            parts.append(f"관심사 {preview}")
+
+    extra_labels = [
+        ("status", "고용 상태"),
+        ("income", "소득"),
+        ("desired_job", "희망 직무"),
+        ("education", "학력·전공"),
+    ]
+    for key, label in extra_labels:
+        value = profile.get(key)
+        if value:
+            parts.append(f"{label} {value}")
+            if len(parts) >= 4:
+                break
+
+    return ", ".join(parts)
+
 def generate_policy_response(
     user_id: str,
     user_input: str,
     *,
-    vectordb: Chroma = policy_vectordb,
+    vectordb: Optional[Chroma] = None,
     keyword_vectordb: Chroma = keyword_vectordb,
     category_vectordb: Chroma = category_vectordb,
 ) -> dict:
@@ -1668,6 +1956,9 @@ def generate_policy_response(
     # ─────────────────────────────── #
     # 👤 세션 메모리 로드 & 머지
     # ─────────────────────────────── #
+    if vectordb is None:
+        vectordb = get_policy_vectordb()
+
     session               = SESSION_STORE[user_id]          # dict with 'user_info', 'recommended_ids'
     prev_info             = session["user_info"] or {}
     prev_recommended_ids  = session["recommended_ids"]
@@ -1753,7 +2044,8 @@ def generate_policy_response(
             interests.append(p)
 
     # 4) 벡터 검색 + 필터링 -------------------------------------------
-    search_query = build_query(user_input, age, region, interests)
+    search_interests = augment_interests_with_job(interests, user_info.get("desired_job"))
+    search_query = build_query(user_input, age, region, search_interests)
     extras = []
     for key in ["status", "income", "desired_job", "education", "special"]:
         value = user_info.get(key)
@@ -1764,13 +2056,28 @@ def generate_policy_response(
         extras.append(hope_region)
     if extras:
         search_query = f"{search_query} {' '.join(extras)}"
-    try:
-        raw_docs = vectordb.similarity_search(search_query, k=50)
-    except Exception:
-        # 검색 오류 시 최소한의 질의로 재시도
-        raw_docs = vectordb.similarity_search(user_input, k=50)
+    filter_sequence = build_filter_sequence(age, region, search_interests, user_info.get("desired_job"))
+    raw_docs, filter_label, job_enforced = adaptive_similarity_search(
+        vectordb,
+        search_query,
+        filter_sequence,
+        fallback_query=user_input,
+        k=50,
+    )
+    job_filter_active = bool(user_info.get("desired_job"))
+    job_relaxed = job_filter_active and not job_enforced
+    region_relaxed = bool(region and filter_label in RELAXED_REGION_LABELS)
 
-    docs = filter_docs(raw_docs, age, search_query, region, interests)
+    docs = filter_docs(
+        raw_docs,
+        age,
+        user_input,
+        region or "",
+        search_interests,
+        desired_job=user_info.get("desired_job"),
+        require_job_match=job_filter_active and not job_relaxed,
+        allow_region_mismatch=region_relaxed,
+    )
 
     # 🔎 이전에 추천했던 정책은 제외 + 중복 응답 차단
     seen_ids = set()
@@ -1785,22 +2092,17 @@ def generate_policy_response(
             break
     docs = filtered_docs
 
-    # 5) 결과가 없을 때 폴백 ------------------------------------------
+    # 5) 결과가 없을 때 안내 ------------------------------------------
     if not docs:
-        fallback_docs = vectordb.similarity_search("청년 정책 전국 공통", k=3)
-        policies = []
-        for d in fallback_docs:
-            policies.append({
-                "policy_id": d.metadata.get("policy_id", ""),
-                "title":     d.metadata.get("title", ""),
-                "summary":   d.metadata.get("summary", "") or d.page_content[:120],
-            })
-        # 👉 세션 업데이트 (fallback도 기록)
-        session["recommended_ids"].update([p["policy_id"] for p in policies])
+        user_info["interests"] = interests
         session["user_info"] = user_info
+        summary_line = summarize_profile_for_message(user_info)
+        message = "조건에 맞는 정책을 찾지 못했어요."
+        if summary_line:
+            message = f"{summary_line}에 맞는 정책을 찾지 못했어요."
+        message += " 나이·지역·관심 분야 외의 정보(소득, 희망 직무 등)를 더 알려주시면 도움이 돼요."
         return {
-            "message": "조건에 맞는 정책을 찾지 못했어요. 전국 공통 정책을 보여드릴게요.",
-            "fallback_policies": policies,
+            "message": message,
             "user_info": user_info,
         }
 
@@ -1830,8 +2132,14 @@ def generate_policy_response(
     # 병합
     user_info["interests"] = interests
 
+    response_message = "추천 정책을 안내드립니다."
+    if region_relaxed and region:
+        response_message += " (지역 조건을 완화해 비슷한 지역 정책도 포함했어요.)"
+    if job_relaxed and job_filter_active:
+        response_message += " (희망 직무에 딱 맞는 정책이 부족해 유사한 정책도 함께 보여드렸어요.)"
+
     return {
-        "message": "추천 정책을 안내드립니다.",
+        "message": response_message,
         "policies": policies,
         "user_info": user_info,
     }

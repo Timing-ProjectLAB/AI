@@ -3,9 +3,25 @@
 from langchain_chroma import Chroma
 from langchain_openai import OpenAIEmbeddings
 
+
+def build_category_filter(interests: list[str]) -> dict | None:
+    clauses = []
+    for interest in interests:
+        normalized = interest.strip()
+        if normalized:
+            clauses.append({"category_tokens": {"$contains": f"|{normalized}|"}})
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$or": clauses}
+
+
 def search_policies(query: str, user_age: int, user_region: str, interests: list[str], db_path: str = "./chroma_policies"):
     embedding = OpenAIEmbeddings()
     vectordb = Chroma(persist_directory=db_path, embedding_function=embedding)
+
+    category_filter = build_category_filter(interests)
 
     # 1. Full 조건 검색
     filters_full = {
@@ -13,9 +29,10 @@ def search_policies(query: str, user_age: int, user_region: str, interests: list
             {"region": {"$eq": user_region}},
             {"min_age": {"$lte": user_age}},
             {"max_age": {"$gte": user_age}},
-            {"categories": {"$in": interests}},
         ]
     }
+    if category_filter:
+        filters_full["$and"].append(category_filter)
 
     results = vectordb.similarity_search(query, k=5, filter=filters_full)
 
@@ -30,9 +47,10 @@ def search_policies(query: str, user_age: int, user_region: str, interests: list
         "$and": [
             {"min_age": {"$lte": user_age}},
             {"max_age": {"$gte": user_age}},
-            {"categories": {"$in": interests}},
         ]
     }
+    if category_filter:
+        filters_no_region["$and"].append(category_filter)
 
     results = vectordb.similarity_search(query, k=3, filter=filters_no_region)
     if results:
@@ -45,9 +63,10 @@ def search_policies(query: str, user_age: int, user_region: str, interests: list
     filters_no_age = {
         "$and": [
             {"region": {"$eq": user_region}},
-            {"categories": {"$in": interests}},
         ]
     }
+    if category_filter:
+        filters_no_age["$and"].append(category_filter)
 
     results = vectordb.similarity_search(query, k=3, filter=filters_no_age)
     if results:
@@ -57,16 +76,15 @@ def search_policies(query: str, user_age: int, user_region: str, interests: list
         return
 
     # 4. 관심사만 사용
-    filters_keywords_only = {
-        "categories": {"$in": interests}
-    }
+    filters_keywords_only = category_filter
 
-    results = vectordb.similarity_search(query, k=3, filter=filters_keywords_only)
-    if results:
-        print(f"\n🔄 [관심사 기반 일반 추천]")
-        for idx, doc in enumerate(results, 1):
-            print_result(idx, doc)
-        return
+    if filters_keywords_only:
+        results = vectordb.similarity_search(query, k=3, filter=filters_keywords_only)
+        if results:
+            print(f"\n🔄 [관심사 기반 일반 추천]")
+            for idx, doc in enumerate(results, 1):
+                print_result(idx, doc)
+            return
 
     # 5. fallback - 필터 없이 검색
     print("\n🚫 조건에 맞는 정책은 없지만, 유사한 정책을 아래에 추천합니다.")
