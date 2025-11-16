@@ -1,2 +1,10 @@
 .env
 chroma_policies/
+kwdb/
+categorydb/
+.venv/
+__pycache__/
+/.AGENTS.md
+/check.md
+.DS_Store
+11.10.md

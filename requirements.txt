@@ -1,6 +1,9 @@
 langchain
 langchain-openai
 langchain-community
+langchain-chroma
 chromadb
 python-dotenv
 openai
+tqdm
+pydantic
